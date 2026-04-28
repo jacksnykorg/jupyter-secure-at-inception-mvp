@@ -1,0 +1,121 @@
+---
+description: Portable Jupyter → export → Snyk Code → fix-in-notebook; package health before pip (no repo-specific filenames)
+alwaysApply: true
+---
+
+# Notebook security pipeline (always follow)
+
+Use this rule in **any** repository where agents edit Jupyter notebooks and install packages. Do not assume fixed notebook or script names—use whatever `.ipynb` files and manifests the project actually contains.
+
+## Primary scenario (treat every request this way)
+
+The **user is instructing you** as they would in a real session: e.g. *“Install `torch` / `numpy` and update the Jupyter notebook to use it,”* or *“Add a cell that does X.”* Your job is **not** only to run commands—it is to follow this pipeline **in order**, as if those installs and edits happen in the same conversation.
+
+| User intent | You do |
+|-------------|--------|
+| Install / upgrade a package (shell `pip`, notebook `%pip`, `!pip`, or manifest change) | **`snyk_package_health_check`** for each package **first**, then install (hooks enforce the order when the gate is on). |
+| Change model, data, or training code | Edit the **`.ipynb`** only; save so export runs. |
+| “Is it secure?” / after edits | Exported **`.py`** gets **Snyk Code**; **fix cells in the notebook**, never only the generated `.py`. |
+
+If the **`stop`** hook reminds you about an unfinished vet, the user (or prior turn) started an install path without completing **`snyk_package_health_check`**—finish that before the next install.
+
+---
+
+## Source of truth
+
+- Each **`.ipynb`** that holds first-party logic is a **source of truth** for that logic.
+- The **sibling `.py`** produced by `nbconvert` (same basename, next to the notebook) is **generated**—never add or fix first-party logic there directly; change the notebook and re-export.
+
+---
+
+## Required sequence
+
+### 1 — Vet packages BEFORE any install
+
+Before adding imports, `%pip install`, `!pip install`, or editing dependency manifests (`requirements.txt`, `pyproject.toml`, `requirements-*.txt`, etc.) for new packages:
+
+1. Run MCP **`snyk_package_health_check`** for **each** candidate package:
+   - `ecosystem`: `pypi` (or `npm`, `maven`, etc.)
+   - `package_name`: the package to vet
+   - `package_version` (optional): the version you plan to pin
+2. Review `overall_rating`, security findings, and maintenance status.
+3. **Disqualify** any package with critical/high vulnerabilities or an inactive/archived status.
+4. Only after health checks pass → proceed to install.
+
+> **Why this order matters:** The `beforeShellExecution` hook (`pip_install_gate.py`) will **block** any pip install until `snyk_package_health_check` has been called. The `beforeMCPExecution` hook clears the gate when the tool is invoked. A manifest line is **not** required before vetting.
+
+After dependencies are recorded in a manifest, run **`snyk test`** (SCA) for the full tree when your team’s process requires it.
+
+---
+
+### 2 — Edit the notebook
+
+Make all behavioural changes in the relevant **`.ipynb`** files. Do not edit exported **`.py`** files for first-party logic.
+
+---
+
+### 3 — Export
+
+If the repo wires **`.cursor/hooks.json`**, the `afterFileEdit` hook (`nbconvert_on_ipynb_edit.py`) may run `nbconvert` automatically when an `.ipynb` is saved. Otherwise trigger manually:
+
+```bash
+python3 -m nbconvert --to python path/to/notebook.ipynb
+```
+
+That writes `path/to/notebook.py` beside the `.ipynb`.
+
+---
+
+### 4 — Snyk Code scan + remediation loop
+
+After export, scan the **generated `.py`** for that notebook with MCP **`snyk_code_scan`** or CLI **`snyk code test`** (absolute path to the file or project root, per your setup).
+
+If findings are found:
+
+1. **Open the matching `.ipynb`** and fix the flagged cell(s) — **never patch only the `.py`**.
+2. Save the notebook → the `afterFileEdit` hook may re-export and (if `SNYK_CODE_TEST_ON_EXPORT=1`) rescans via CLI automatically.
+3. Run MCP **`snyk_code_scan`** again to confirm.
+4. Repeat until no new issues are introduced.
+
+> **Mapping findings to cells:** The exported `.py` often contains `# In[n]:` markers from nbconvert. Use the line number from the Snyk report to locate the marker, then edit the corresponding cell in the notebook.
+
+---
+
+### 5 — Iterate
+
+Continue editing in the notebook(s). Re-export and rescan on every meaningful change (automated by the hook when configured).
+
+---
+
+## Hook summary (generic)
+
+Paths below are **conventional**—copy these scripts into `.cursor/hooks/` in each repo and point `hooks.json` at them.
+
+| Hook event | Script (typical name) | Purpose |
+|---|---|---|
+| `afterFileEdit` | `nbconvert_on_ipynb_edit.py` | Export `.ipynb` → sibling `.py`; optional Snyk CLI scan; emit remediation message if findings |
+| `beforeShellExecution` | `pip_install_gate.py` | Block pip until vet; after MCP clears pending, a **one-shot voucher** allows the **next** `pip install`, then vet again |
+| `beforeMCPExecution` | `pip_install_gate.py` | On `snyk_package_health_check` while install is pending → clear state and **grant** that voucher |
+| `stop` | `pip_install_gate.py` | If a session ends with a blocked install still pending vet, remind and clear pending state |
+
+Enable the pip gate: create **`.cursor/enable-snyk-pip-gate`** (empty file). Without it, the gate falls back to optional **`snyk test`** via CLI on simple `pip install` lines if the Snyk CLI is installed.
+
+---
+
+## Adopting this template in another repository
+
+1. Copy **`.cursor/hooks/pip_install_gate.py`**, **`.cursor/hooks/nbconvert_on_ipynb_edit.py`**, and **`.cursor/hooks.json`** (or merge hook entries into an existing `hooks.json`).
+2. Keep **`.cursor/rules/agent-notebook-workflow.mdc`** (this file) or merge its contents into your global / project rules.
+3. Add **`AGENTS.md`** (or merge) at the repo root so agents see the same flow in repo-specific wording if you customize it there.
+4. Optionally add a **one-shot verify script** that discovers `*.ipynb` and runs `nbconvert` + `snyk code test` / `snyk test`—point it at your tree (`NOTEBOOK_ROOT` env var if supported).
+5. Optionally add **`.vscode/tasks.json`** tasks for export + Snyk on folder open.
+
+Do **not** hardcode a single notebook name in shared rules—each team names its own notebooks and manifests.
+
+---
+
+## Optional repo-specific notes
+
+If this repository keeps a **CLI or library entrypoint** that mirrors notebook behavior (e.g. a `*_advanced.py` or `run_training.py`), document in **that repo’s** `AGENTS.md` or README: *notebook first → export → Snyk Code → then align the script*—not in the portable rule above.
+
+See also **`AGENTS.md`** at the repo root when present.
