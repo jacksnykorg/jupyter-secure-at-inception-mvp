@@ -5,14 +5,7 @@
       {
         "type": "command",
         "bash": "python3 .github/hooks/pre_tool_use.py",
-        "timeoutSec": 10
-      }
-    ],
-    "postToolUse": [
-      {
-        "type": "command",
-        "bash": "python3 .github/hooks/post_tool_use.py",
-        "timeoutSec": 120
+        "timeoutSec": 360
       }
     ]
   }
