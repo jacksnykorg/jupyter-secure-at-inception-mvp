@@ -15,6 +15,13 @@
         "timeout": 150
       }
     ],
+    "beforeFileEdit": [
+      {
+        "command": "python3 .cursor/hooks/pip_install_gate.py",
+        "matcher": "\\.ipynb$",
+        "timeout": 150
+      }
+    ],
     "stop": [
       {
         "command": "python3 .cursor/hooks/pip_install_gate.py",

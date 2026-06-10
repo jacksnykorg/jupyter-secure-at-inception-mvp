@@ -190,8 +190,10 @@ def _parse_packages(command: str) -> list[str] | None:
     while i < len(parts):
         t = parts[i]
         if t.startswith("-"):
-            if t in ("-r", "--requirement", "-e", "--editable"):
-                return None  # complex invocation — skip gate
+            if t in ("-e", "--editable"):
+                return None
+            if t in ("-r", "--requirement"):
+                return None  # signal: caller must handle requirements file
             if t in ("-c", "--constraint", "-f", "--find-links") and i + 1 < len(parts):
                 i += 2
                 continue
@@ -202,6 +204,54 @@ def _parse_packages(command: str) -> list[str] | None:
         reqs.append(t)
         i += 1
     return reqs if reqs else None
+
+
+def _reqs_file_path_from_command(command: str, workspace: str) -> "Path | None":
+    """If the command has -r <file>, return the resolved Path if the file exists."""
+    m = re.search(r"(?:-r|--requirement)\s+([^\s]+)", command, re.I)
+    if not m:
+        return None
+    raw = m.group(1).strip().strip("'\"")
+    p = Path(raw) if Path(raw).is_absolute() else Path(workspace) / raw
+    resolved = p.resolve()
+    return resolved if resolved.is_file() else None
+
+
+def _parse_reqs_file(path: "Path") -> list[str]:
+    """Parse a requirements.txt into package specs, skipping flags, VCS URLs, and comments."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    packages: list[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("-") or line.startswith("--"):
+            continue
+        if "://" in line or line.startswith("git+"):
+            continue
+        line = re.split(r"\s+#", line)[0].strip()
+        if line:
+            packages.append(line)
+    return packages
+
+
+def _extract_pip_from_cell_source(tool_input: dict) -> list[str]:
+    """
+    Return pip install lines found in cell-source-like args.
+    Scans fields directly (not the JSON blob) so leading-whitespace anchors work.
+    """
+    cell_source_keys = ("new_source", "source", "cell_source", "content", "text", "code", "src")
+    commands: list[str] = []
+    for key in cell_source_keys:
+        val = tool_input.get(key)
+        if not isinstance(val, str):
+            continue
+        for line in val.splitlines():
+            stripped = line.strip()
+            if stripped and _PIP_RE.search(stripped):
+                commands.append(stripped)
+    return commands
 
 
 def _strip_pkg_name(spec: str) -> str:
@@ -337,29 +387,17 @@ def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]
 
 
 # ---------------------------------------------------------------------------
-# Hook handlers
+# Shared gate logic
 # ---------------------------------------------------------------------------
 
-def _handle_before_shell(data: dict, workspace: str) -> None:
-    command = data.get("command", "")
-    if not _is_pip_install(command):
-        _allow()
-        return
-
-    if not _gate_enabled(workspace):
-        _allow()
-        return
-
-    packages = _parse_packages(command)
-    if packages is None:
-        # Complex invocation (requirements file, VCS URL, editable) — skip gate
-        _allow()
-        return
-
+def _run_pip_gate_checks(packages: list[str], workspace: str, context: str = "pip install") -> bool:
+    """
+    Age + Snyk checks for a resolved package list.
+    Returns True if the install should be allowed; calls _deny() and returns False if blocked.
+    """
     max_age_hours = float(os.environ.get("SNYK_PIP_GATE_MAX_AGE_HOURS", "24"))
 
-    # 1. PyPI release-age check — also surface the newest safe version to pin
-    too_new: list[tuple[str, float, str | None]] = []  # (pkg_name, age, safe_ver)
+    too_new: list[tuple[str, float, "str | None"]] = []
     for spec in packages:
         age, safe_ver = _pypi_check(spec, max_age_hours)
         _debug(f"{spec}: age={age} safe_ver={safe_ver}")
@@ -384,33 +422,89 @@ def _handle_before_shell(data: dict, workspace: str) -> None:
             if retry_specs
             else f"Wait until the package(s) are at least {max_age_hours:.0f} hours old."
         )
-        _log(f"INSTALL BLOCKED — too-new packages: {[t[0] for t in too_new]}")
+        _log(f"BLOCKED ({context}) — too-new: {[t[0] for t in too_new]}")
         _deny(
-            f"Install blocked: package(s) released within the last {max_age_hours:.0f} hours.\n"
+            f"{context} blocked: package(s) released within the last {max_age_hours:.0f} hours.\n"
             f"{summary}\n{retry_hint}",
-            (
-                f"INSTALL BLOCKED: the following package(s) were published within the last "
-                f"{max_age_hours:.0f} hours:\n{summary}\n{retry_hint}\n"
-                "Set SNYK_PIP_GATE_MAX_AGE_HOURS to adjust the threshold."
-            ),
+            f"INSTALL BLOCKED ({context}): packages published within {max_age_hours:.0f}h:\n"
+            f"{summary}\n{retry_hint}\nSet SNYK_PIP_GATE_MAX_AGE_HOURS to adjust.",
         )
-        return
+        return False
 
-    # 2. Snyk open-source vulnerability check
     passed, reason = _snyk_test_packages(packages, workspace)
     if not passed:
-        _log(f"INSTALL BLOCKED — Snyk found vulnerabilities in {packages}")
+        _log(f"BLOCKED ({context}) — Snyk vulnerabilities in {packages}")
         _deny(
-            f"Install blocked: Snyk found known vulnerabilities in the requested packages.\n{reason}",
-            (
-                f"INSTALL BLOCKED: Snyk reported vulnerabilities for {packages!r}.\n{reason}\n"
-                "Fix the version constraints to avoid vulnerable releases, then retry."
-            ),
+            f"{context} blocked: Snyk found known vulnerabilities.\n{reason}",
+            f"INSTALL BLOCKED ({context}): Snyk reported vulnerabilities.\n{reason}\n"
+            "Fix the version constraints, then retry.",
         )
+        return False
+
+    _log(f"allowed ({context}) — all checks passed for {packages}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Hook handlers
+# ---------------------------------------------------------------------------
+
+def _handle_before_shell(data: dict, workspace: str) -> None:
+    command = data.get("command", "")
+    if not _is_pip_install(command):
+        _allow()
         return
 
-    _log(f"pip install allowed — all checks passed for {packages}")
-    _allow()
+    if not _gate_enabled(workspace):
+        _allow()
+        return
+
+    packages = _parse_packages(command)
+    if packages is None:
+        # Check for -r requirements.txt — read the file and gate its contents
+        reqs_path = _reqs_file_path_from_command(command, workspace)
+        if reqs_path is None:
+            # Editable install or unresolvable path — skip gate
+            _allow()
+            return
+        packages = _parse_reqs_file(reqs_path)
+        if not packages:
+            _allow()
+            return
+        if _run_pip_gate_checks(packages, workspace, context=f"pip install -r {reqs_path.name}"):
+            _allow()
+        return
+
+    if _run_pip_gate_checks(packages, workspace):
+        _allow()
+
+
+def _handle_notebook_edit(data: dict, workspace: str) -> None:
+    """
+    Gate 3 — fires before a notebook cell is written (beforeFileEdit / beforeToolUse
+    for notebook-edit tools). Blocks the edit at write-time if the cell source
+    contains a pip install that fails the age or Snyk check.
+    """
+    if not _gate_enabled(workspace):
+        _out({"exit_code": 0})
+        return
+
+    # Cursor passes cell source under various keys depending on the tool
+    tool_input = data.get("tool_input") or data.get("toolArgs") or data
+    cell_cmds = _extract_pip_from_cell_source(tool_input)
+    if not cell_cmds:
+        _out({"exit_code": 0})
+        return
+
+    for cmd in cell_cmds:
+        normalised = re.sub(r"^[%!]", "", cmd).strip()
+        pkgs = _parse_packages(normalised)
+        if not pkgs:
+            continue
+        if not _run_pip_gate_checks(pkgs, workspace, context="Notebook cell pip install"):
+            return  # _deny already called inside _run_pip_gate_checks
+
+    _out({"exit_code": 0})
 
 
 def _handle_stop(data: dict, workspace: str) -> None:
@@ -436,6 +530,8 @@ def main() -> None:
 
     if event == "beforeShellExecution":
         _handle_before_shell(data, workspace)
+    elif event in ("beforeFileEdit", "beforeNotebookEdit"):
+        _handle_notebook_edit(data, workspace)
     elif event == "stop":
         _handle_stop(data, workspace)
     else:

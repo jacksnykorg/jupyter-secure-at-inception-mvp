@@ -85,6 +85,16 @@ _NOTEBOOK_EXEC_CMD = re.compile(
     re.I | re.S,
 )
 
+# Tool names that write/edit notebook cell content
+_TOOLNAME_NOTEBOOK_EDIT = re.compile(
+    r"(notebook.?edit|edit.?cell|cell.?edit|insert.?cell|replace.?cell|"
+    r"write.?cell|notebook.?write|create.?cell|update.?cell|set.?cell)",
+    re.I,
+)
+
+# Arg keys that carry cell source code in NotebookEdit-style tool calls
+_CELL_SOURCE_KEYS = ("new_source", "source", "cell_source", "content", "text", "code", "src")
+
 _TOOLNAME_NOTEBOOK_EXEC = re.compile(
     r"(jupyter|ipython|nbconvert|papermill|nbclient|execute_?cell|run_?cell|notebook_?run|run_?notebook)",
     re.I,
@@ -417,8 +427,10 @@ def _parse_pip_packages(command: str) -> list[str] | None:
     while i < len(parts):
         t = parts[i]
         if t.startswith("-"):
-            if t in ("-r", "--requirement", "-e", "--editable"):
-                return None  # complex invocation — skip gate
+            if t in ("-e", "--editable"):
+                return None  # can't gate editable installs
+            if t in ("-r", "--requirement"):
+                return None  # signal: has requirements file; caller must handle
             if t in ("-c", "--constraint", "-f", "--find-links") and i + 1 < len(parts):
                 i += 2
                 continue
@@ -429,6 +441,62 @@ def _parse_pip_packages(command: str) -> list[str] | None:
         reqs.append(t)
         i += 1
     return reqs if reqs else None
+
+
+def _reqs_file_path_from_command(command: str, cwd: str) -> Path | None:
+    """
+    If the command contains ``-r <file>`` or ``--requirement <file>``,
+    return the resolved Path if the file exists; otherwise None.
+    """
+    m = re.search(r"(?:-r|--requirement)\s+([^\s]+)", command, re.I)
+    if not m:
+        return None
+    raw = m.group(1).strip().strip("'\"")
+    p = Path(raw) if Path(raw).is_absolute() else Path(cwd) / raw
+    resolved = p.resolve()
+    return resolved if resolved.is_file() else None
+
+
+def _parse_reqs_file(path: Path) -> list[str]:
+    """
+    Parse a requirements.txt into package specs, skipping flags, VCS URLs,
+    chained -r includes, and blank/comment lines.
+    """
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    packages: list[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-"):
+            continue  # -r, --index-url, etc.
+        if "://" in line or line.startswith("git+"):
+            continue  # VCS / URL deps — cannot version-check via PyPI
+        line = re.split(r"\s+#", line)[0].strip()  # strip inline comments
+        if line:
+            packages.append(line)
+    return packages
+
+
+def _extract_pip_from_cell_source(tool_args: dict) -> list[str]:
+    """
+    Return pip install command lines found in cell-source-like tool args.
+    Scans each _CELL_SOURCE_KEYS field directly (not the JSON blob) so that
+    the leading-whitespace anchors in _PIP_RE fire correctly.
+    """
+    commands: list[str] = []
+    for key in _CELL_SOURCE_KEYS:
+        val = tool_args.get(key)
+        if not isinstance(val, str):
+            continue
+        for line in val.splitlines():
+            stripped = line.strip()
+            if stripped and _PIP_RE.search(stripped):
+                commands.append(stripped)
+    return commands
 
 
 def _strip_pkg_name(spec: str) -> str:
@@ -562,29 +630,16 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
     return False, f"Snyk test found issues (exit {r.returncode}):\n{tail}"
 
 
-def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
+def _run_pip_gate_checks(packages: list[str], cwd: str, context: str = "pip install") -> None:
     """
-    Gate 2 entry point. Blocks on too-new or vulnerable packages; provides an
-    auto-retry suggestion whenever a safe pinned version can be found.
+    Core age + Snyk checks for a resolved list of package specs.
+    Calls _deny() and returns if any check fails; returns silently to allow.
+    context is used in deny messages to describe where the packages came from.
     """
-    if not _pip_gate_enabled(cwd):
-        return
-
-    command = _shell_command(tool_name, tool_args) or str(tool_args.get("command") or "")
-    if not command or not _PIP_RE.search(command):
-        return
-
-    packages = _parse_pip_packages(command)
-    if packages is None:
-        # Complex invocation (requirements file, VCS URL, editable) — skip gate
-        return
-
     max_age_hours = float(os.environ.get("SNYK_PIP_GATE_MAX_AGE_HOURS", "24"))
 
-    # 1. PyPI release-age check — block packages too new to have been reviewed.
-    #    For each blocked package, also surface the newest safe version so the
-    #    agent can immediately retry with a pinned spec.
-    too_new: list[tuple[str, float, str | None]] = []  # (pkg_name, age, safe_ver)
+    # 1. PyPI release-age check
+    too_new: list[tuple[str, float, str | None]] = []
     for spec in packages:
         age, safe_ver = _pypi_check(spec, max_age_hours)
         if age is not None and age < max_age_hours:
@@ -603,9 +658,8 @@ def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
             lines.append(line)
 
         msg = (
-            "pip install blocked: the following package(s) were released within the last "
-            f"{max_age_hours:.0f} hours and may be malicious:\n"
-            + "\n".join(lines)
+            f"{context} blocked: the following package(s) were released within the last "
+            f"{max_age_hours:.0f} hours and may be malicious:\n" + "\n".join(lines)
         )
         if retry_specs:
             msg += f"\nRetry with: pip install {' '.join(retry_specs)}"
@@ -614,17 +668,69 @@ def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
         _deny(msg)
         return
 
-    # 2. Snyk open-source vulnerability check.
+    # 2. Snyk open-source vulnerability check
     passed, reason = _snyk_test_packages(packages, cwd)
     if not passed:
-        _deny(
-            f"pip install blocked by Snyk: known vulnerabilities found in requested packages.\n{reason}"
-        )
+        _deny(f"{context} blocked by Snyk: known vulnerabilities found.\n{reason}")
+
+
+def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
+    """
+    Gate 2 entry point for shell-tool pip install commands.
+    Handles both inline package specs and -r requirements.txt.
+    """
+    if not _pip_gate_enabled(cwd):
+        return
+
+    command = _shell_command(tool_name, tool_args) or str(tool_args.get("command") or "")
+    if not command or not _PIP_RE.search(command):
+        return
+
+    packages = _parse_pip_packages(command)
+    if packages is None:
+        # _parse_pip_packages returns None for -r, -e, VCS URLs.
+        # For -r requirements.txt, read the file and gate its contents.
+        reqs_path = _reqs_file_path_from_command(command, cwd)
+        if reqs_path is None:
+            # Editable install or unresolvable requirements file — skip gate
+            return
+        packages = _parse_reqs_file(reqs_path)
+        if not packages:
+            return
+        _run_pip_gate_checks(packages, cwd, context=f"pip install -r {reqs_path.name}")
+        return
+
+    _run_pip_gate_checks(packages, cwd)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+def _check_notebook_cell_edit(cwd: str, tool_name: str, tool_args: dict) -> None:
+    """
+    Gate 3 — fires when an agent writes a notebook cell containing pip install.
+    Blocks the edit at write-time if the package fails the age or Snyk check,
+    so a malicious package can never be saved into the notebook in the first place.
+    """
+    if not _pip_gate_enabled(cwd):
+        return
+    if not _TOOLNAME_NOTEBOOK_EDIT.search(tool_name):
+        return
+
+    cell_cmds = _extract_pip_from_cell_source(tool_args)
+    if not cell_cmds:
+        return
+
+    for cmd in cell_cmds:
+        # Normalise %pip / !pip → bare pip install …
+        normalised = re.sub(r"^[%!]", "", cmd).strip()
+        pkgs = _parse_pip_packages(normalised)
+        if not pkgs:
+            # If it's a -r flag inside a cell, there's not much we can resolve
+            continue
+        _run_pip_gate_checks(pkgs, cwd, context="Notebook cell pip install")
 
 
 def main() -> None:
@@ -636,6 +742,9 @@ def main() -> None:
 
     cwd, tool_name, tool_args = _normalize_pre_tool_payload(data)
 
+    # Gate 3: block pip installs being written into notebook cells at edit time
+    _check_notebook_cell_edit(cwd, tool_name, tool_args)
+
     if _looks_like_agent_notebook_cell_execution(tool_name, tool_args):
         if not _export_and_snyk_scan_before_notebook_execution(cwd, tool_name, tool_args):
             return
@@ -643,6 +752,7 @@ def main() -> None:
     if tool_name.lower() not in _SHELL_TOOLS:
         return
 
+    # Gate 2: block pip install shell commands (including -r requirements.txt)
     _check_pip_install(cwd, tool_name, tool_args)
 
 
