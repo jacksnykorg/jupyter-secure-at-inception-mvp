@@ -12,13 +12,14 @@
       {
         "command": "python3 .cursor/hooks/pip_install_gate.py",
         "matcher": "pip3?\\s+install|python3?\\s+-m\\s+pip\\s+install|%pip\\s+install|!pip3?\\s+install",
-        "timeout": 30
+        "timeout": 150
       }
     ],
-    "beforeMCPExecution": [
+    "beforeFileEdit": [
       {
         "command": "python3 .cursor/hooks/pip_install_gate.py",
-        "timeout": 10
+        "matcher": "\\.ipynb$",
+        "timeout": 150
       }
     ],
     "stop": [
