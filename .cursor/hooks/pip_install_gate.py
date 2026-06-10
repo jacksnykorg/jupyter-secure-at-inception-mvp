@@ -412,6 +412,13 @@ def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]
         return True, ""
 
     tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
+
+    # exit 1 = vulnerabilities found → block.
+    # exit 2 + 401 = auth not configured → fail-open (unconfigured Snyk shouldn't
+    # hard-stop installs).  Resolution failures (422) remain blocked.
+    if r.returncode != 1 and "401" in tail:
+        return True, ""
+
     return False, f"Snyk found vulnerabilities (exit {r.returncode}):\n{tail}"
 
 

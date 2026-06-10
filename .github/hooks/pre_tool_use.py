@@ -663,6 +663,15 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
         return True, ""
 
     tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
+
+    # exit 1 = vulnerabilities found → block.
+    # exit 2 = Snyk infrastructure error (e.g. auth failure 401) → fail-open so an
+    # unconfigured Snyk CLI doesn't hard-stop every install.  A dependency-resolution
+    # error (422 SNYK-OS-PYTHON-0013) is also exit 2 but is treated as a hard block
+    # because unresolvable packages cannot be verified and may be malicious.
+    if r.returncode != 1 and "401" in tail:
+        return True, ""
+
     return False, f"Snyk test found issues (exit {r.returncode}):\n{tail}"
 
 
