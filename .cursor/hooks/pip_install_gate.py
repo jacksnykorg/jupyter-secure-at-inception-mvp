@@ -238,10 +238,11 @@ def _parse_reqs_file(path: "Path") -> list[str]:
 
 def _extract_pip_from_cell_source(tool_input: dict) -> list[str]:
     """
-    Return pip install lines found in cell-source-like args.
-    Scans fields directly (not the JSON blob) so leading-whitespace anchors work.
+    Return pip install lines found in structured cell-source args
+    (NotebookEdit-style tools where the cell source is a named key).
+    Scans fields directly so leading-whitespace anchors work.
     """
-    cell_source_keys = ("new_source", "source", "cell_source", "content", "text", "code", "src")
+    cell_source_keys = ("new_source", "source", "cell_source", "text", "code", "src")
     commands: list[str] = []
     for key in cell_source_keys:
         val = tool_input.get(key)
@@ -251,6 +252,34 @@ def _extract_pip_from_cell_source(tool_input: dict) -> list[str]:
             stripped = line.strip()
             if stripped and _PIP_RE.search(stripped):
                 commands.append(stripped)
+    return commands
+
+
+def _pip_installs_from_notebook_json(text: str) -> list[str]:
+    """
+    Parse a string as notebook JSON and return pip install lines found in any
+    code cell's source. Used for Cursor's beforeFileEdit payload which delivers
+    the full notebook JSON in new_content. Falls back to a permissive text scan.
+    """
+    commands: list[str] = []
+    try:
+        nb = json.loads(text)
+        for cell in nb.get("cells") or []:
+            if cell.get("cell_type") != "code":
+                continue
+            src = cell.get("source") or ""
+            if isinstance(src, list):
+                src = "".join(src)
+            for line in src.splitlines():
+                stripped = line.strip()
+                if stripped and _PIP_RE.search(stripped):
+                    commands.append(stripped)
+    except (json.JSONDecodeError, AttributeError):
+        _pip_bare = re.compile(
+            r"""(?:^|[^a-zA-Z0-9_])(%pip|!pip3?|pip3?)\s+install\b(.+)""", re.I | re.M
+        )
+        for m in _pip_bare.finditer(text):
+            commands.append(f"{m.group(1)} install {m.group(2).split(chr(10))[0].strip()}")
     return commands
 
 
@@ -481,28 +510,43 @@ def _handle_before_shell(data: dict, workspace: str) -> None:
 
 def _handle_notebook_edit(data: dict, workspace: str) -> None:
     """
-    Gate 3 — fires before a notebook cell is written (beforeFileEdit / beforeToolUse
-    for notebook-edit tools). Blocks the edit at write-time if the cell source
-    contains a pip install that fails the age or Snyk check.
+    Gate 3 — fires before a notebook file is written (beforeFileEdit on .ipynb).
+
+    Cursor's beforeFileEdit payload delivers the full notebook JSON in new_content.
+    This handler parses that JSON to find pip install lines in code cells, then
+    runs the same age + Snyk checks as Gate 2.
     """
     if not _gate_enabled(workspace):
         _out({"exit_code": 0})
         return
 
-    # Cursor passes cell source under various keys depending on the tool
-    tool_input = data.get("tool_input") or data.get("toolArgs") or data
-    cell_cmds = _extract_pip_from_cell_source(tool_input)
-    if not cell_cmds:
+    pip_cmds: list[str] = []
+
+    # Path 1: structured cell source (e.g. a notebook-edit MCP tool)
+    tool_input = data.get("tool_input") or data.get("toolArgs") or {}
+    if isinstance(tool_input, dict):
+        pip_cmds = _extract_pip_from_cell_source(tool_input)
+
+    # Path 2: Cursor beforeFileEdit — full notebook JSON in new_content
+    if not pip_cmds:
+        for key in ("new_content", "content", "new_string"):
+            body = data.get(key) or (tool_input.get(key) if isinstance(tool_input, dict) else None) or ""
+            if body:
+                pip_cmds = _pip_installs_from_notebook_json(body)
+                if pip_cmds:
+                    break
+
+    if not pip_cmds:
         _out({"exit_code": 0})
         return
 
-    for cmd in cell_cmds:
+    for cmd in pip_cmds:
         normalised = re.sub(r"^[%!]", "", cmd).strip()
         pkgs = _parse_packages(normalised)
         if not pkgs:
             continue
         if not _run_pip_gate_checks(pkgs, workspace, context="Notebook cell pip install"):
-            return  # _deny already called inside _run_pip_gate_checks
+            return  # _deny already called
 
     _out({"exit_code": 0})
 

@@ -85,15 +85,21 @@ _NOTEBOOK_EXEC_CMD = re.compile(
     re.I | re.S,
 )
 
-# Tool names that write/edit notebook cell content
+# Tool names that write/edit notebook cell content via dedicated notebook tools
 _TOOLNAME_NOTEBOOK_EDIT = re.compile(
     r"(notebook.?edit|edit.?cell|cell.?edit|insert.?cell|replace.?cell|"
     r"write.?cell|notebook.?write|create.?cell|update.?cell|set.?cell)",
     re.I,
 )
 
-# Arg keys that carry cell source code in NotebookEdit-style tool calls
+# Generic file-write tool names that can also overwrite a .ipynb
+_TOOLNAME_FILE_WRITE = re.compile(r"^(edit|write|str_replace_editor|replace_in_file|overwrite)$", re.I)
+
+# Arg keys that carry cell source in NotebookEdit-style tool calls
 _CELL_SOURCE_KEYS = ("new_source", "source", "cell_source", "content", "text", "code", "src")
+
+# Arg keys that carry the new file body in Edit/Write tool calls
+_FILE_CONTENT_KEYS = ("new_string", "content", "new_content", "text", "file_content")
 
 _TOOLNAME_NOTEBOOK_EXEC = re.compile(
     r"(jupyter|ipython|nbconvert|papermill|nbclient|execute_?cell|run_?cell|notebook_?run|run_?notebook)",
@@ -484,8 +490,7 @@ def _parse_reqs_file(path: Path) -> list[str]:
 def _extract_pip_from_cell_source(tool_args: dict) -> list[str]:
     """
     Return pip install command lines found in cell-source-like tool args.
-    Scans each _CELL_SOURCE_KEYS field directly (not the JSON blob) so that
-    the leading-whitespace anchors in _PIP_RE fire correctly.
+    Scans each _CELL_SOURCE_KEYS field directly so leading-whitespace anchors fire.
     """
     commands: list[str] = []
     for key in _CELL_SOURCE_KEYS:
@@ -496,6 +501,37 @@ def _extract_pip_from_cell_source(tool_args: dict) -> list[str]:
             stripped = line.strip()
             if stripped and _PIP_RE.search(stripped):
                 commands.append(stripped)
+    return commands
+
+
+def _pip_installs_from_notebook_json(text: str) -> list[str]:
+    """
+    Parse a string as notebook JSON and return pip install lines found in any
+    code cell's source. Used for Edit/Write tool calls on .ipynb files and
+    for Cursor's beforeFileEdit payload which delivers the full notebook JSON.
+    Falls back to a permissive text scan if JSON parsing fails.
+    """
+    commands: list[str] = []
+    try:
+        nb = json.loads(text)
+        for cell in nb.get("cells") or []:
+            if cell.get("cell_type") != "code":
+                continue
+            src = cell.get("source") or ""
+            if isinstance(src, list):
+                src = "".join(src)
+            for line in src.splitlines():
+                stripped = line.strip()
+                if stripped and _PIP_RE.search(stripped):
+                    commands.append(stripped)
+    except (json.JSONDecodeError, AttributeError):
+        # Not valid notebook JSON — do a permissive text scan
+        # (e.g. Edit tool sending a partial new_string fragment)
+        _pip_bare = re.compile(
+            r"""(?:^|[^a-zA-Z0-9_])(%pip|!pip3?|pip3?)\s+install\b(.+)""", re.I | re.M
+        )
+        for m in _pip_bare.finditer(text):
+            commands.append(f"{m.group(1)} install {m.group(2).split(chr(10))[0].strip()}")
     return commands
 
 
@@ -711,24 +747,45 @@ def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
 def _check_notebook_cell_edit(cwd: str, tool_name: str, tool_args: dict) -> None:
     """
     Gate 3 — fires when an agent writes a notebook cell containing pip install.
-    Blocks the edit at write-time if the package fails the age or Snyk check,
-    so a malicious package can never be saved into the notebook in the first place.
+    Covers two paths:
+      • NotebookEdit-family tools: cell source is a structured arg (new_source etc.)
+      • Edit/Write tools on .ipynb: new content is raw notebook JSON or a fragment
+    Blocks the write if any package fails the age or Snyk check.
     """
     if not _pip_gate_enabled(cwd):
         return
-    if not _TOOLNAME_NOTEBOOK_EDIT.search(tool_name):
+
+    pip_cmds: list[str] = []
+
+    if _TOOLNAME_NOTEBOOK_EDIT.search(tool_name):
+        # Dedicated notebook cell editor — cell source is in a structured arg
+        pip_cmds = _extract_pip_from_cell_source(tool_args)
+
+    elif _TOOLNAME_FILE_WRITE.search(tool_name):
+        # Generic Edit / Write tool — check if target is a .ipynb
+        target = ""
+        for k in ("path", "file_path", "filename", "filepath"):
+            target = str(tool_args.get(k) or "")
+            if target:
+                break
+        if not target.lower().endswith(".ipynb"):
+            return
+        # Extract the body being written and scan it as notebook JSON
+        body = ""
+        for k in _FILE_CONTENT_KEYS:
+            body = str(tool_args.get(k) or "")
+            if body:
+                break
+        if body:
+            pip_cmds = _pip_installs_from_notebook_json(body)
+
+    if not pip_cmds:
         return
 
-    cell_cmds = _extract_pip_from_cell_source(tool_args)
-    if not cell_cmds:
-        return
-
-    for cmd in cell_cmds:
-        # Normalise %pip / !pip → bare pip install …
+    for cmd in pip_cmds:
         normalised = re.sub(r"^[%!]", "", cmd).strip()
         pkgs = _parse_pip_packages(normalised)
         if not pkgs:
-            # If it's a -r flag inside a cell, there's not much we can resolve
             continue
         _run_pip_gate_checks(pkgs, cwd, context="Notebook cell pip install")
 
