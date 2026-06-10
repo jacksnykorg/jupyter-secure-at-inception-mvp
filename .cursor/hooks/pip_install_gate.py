@@ -431,15 +431,46 @@ def _osv_check_packages(packages: list[str]) -> tuple[bool, str]:
 # Snyk open-source vulnerability check (supplementary)
 # ---------------------------------------------------------------------------
 
+def _pypi_latest_version(pkg_name: str) -> "str | None":
+    """Return the latest non-yanked stable version of a package from PyPI."""
+    try:
+        url = f"https://pypi.org/pypi/{urllib.parse.quote(pkg_name)}/json"
+        req = urllib.request.Request(url, headers={"User-Agent": "snyk-pip-gate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        releases = data.get("releases", {})
+        candidates = []
+        for ver, files in releases.items():
+            if not files or all(f.get("yanked") for f in files):
+                continue
+            try:
+                parts = [int(x) for x in ver.split(".")[:3]]
+                candidates.append((parts, ver))
+            except ValueError:
+                pass
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
 def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]:
     """
-    Run ``snyk test`` against a temporary requirements file.
-    Returns (passed, failure_reason). Fails open if snyk is unavailable.
+    Run ``snyk test --json`` against a temp requirements file.
+    Parses JSON to report only security vulns (not license issues).
+    - exit 0  → allow
+    - exit 1  → hard block with SNYK-PYTHON-xxx IDs
+    - exit 2  → Snyk can't verify (pip resolution failure) → hard block, suggest latest stable
     """
     snyk = shutil.which("snyk")
     if not snyk:
-        _log("snyk not in PATH — skipping open-source vulnerability check")
-        return True, ""
+        _log("snyk not in PATH — blocking install (cannot verify package safety)")
+        return False, "Snyk CLI not found on PATH — cannot verify package safety."
+
+    venv_python = Path(workspace) / ".venv" / "bin" / "python3"
+    python_cmd = str(venv_python) if venv_python.exists() else sys.executable
 
     snyk_timeout = int(os.environ.get("SNYK_PIP_GATE_SNYK_TIMEOUT", "120"))
     tmp_path: str | None = None
@@ -453,7 +484,7 @@ def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]
 
         r = subprocess.run(
             [snyk, "test", f"--file={tmp_path}", "--package-manager=pip",
-             f"--command={sys.executable}"],
+             f"--command={python_cmd}", "--json"],
             cwd=workspace,
             capture_output=True,
             text=True,
@@ -462,8 +493,7 @@ def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]
     except subprocess.TimeoutExpired:
         return False, f"Snyk test timed out after {snyk_timeout}s."
     except OSError as e:
-        _log(f"snyk test could not run: {e}")
-        return True, ""  # fail-open
+        return False, f"Snyk could not run: {e}"
     finally:
         if tmp_path:
             try:
@@ -474,15 +504,38 @@ def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]
     if r.returncode == 0:
         return True, ""
 
-    tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
+    if r.returncode != 1:
+        suggestions = []
+        for spec in packages:
+            name = _strip_pkg_name(spec)
+            latest = _pypi_latest_version(name)
+            if latest:
+                suggestions.append(f"pip install {name}=={latest}")
+        hint = ("\nTry the latest stable version instead:\n  " + "\n  ".join(suggestions)
+                if suggestions else "")
+        return False, f"Snyk could not verify this package (dependency resolution failed).{hint}"
 
-    # exit 1 = vulnerabilities found → block.
-    # exit 2 + 401 = auth not configured → fail-open (unconfigured Snyk shouldn't
-    # hard-stop installs).  Resolution failures (422) remain blocked.
-    if r.returncode != 1 and "401" in tail:
-        return True, ""
-
-    return False, f"Snyk found vulnerabilities (exit {r.returncode}):\n{tail}"
+    try:
+        data = json.loads(r.stdout)
+        vulns = [v for v in data.get("vulnerabilities", [])
+                 if v.get("type") != "license"]
+        if not vulns:
+            return True, ""
+        lines: list[str] = []
+        seen: set[str] = set()
+        for v in vulns:
+            vid = v.get("id", "")
+            if vid in seen:
+                continue
+            seen.add(vid)
+            sev = v.get("severity", "").upper()
+            title = v.get("title", "vulnerability")
+            pkg = v.get("packageName", "")
+            lines.append(f"  • [{sev}] {vid} in {pkg}: {title}")
+        return False, "Snyk found security vulnerabilities:\n" + "\n".join(lines[:10])
+    except Exception:
+        tail = (r.stdout or r.stderr or "")[-1000:]
+        return False, f"Snyk found vulnerabilities:\n{tail}"
 
 
 # ---------------------------------------------------------------------------
@@ -530,20 +583,16 @@ def _run_pip_gate_checks(packages: list[str], workspace: str, context: str = "pi
         )
         return False
 
-    # OSV advisory check — works pre-install, no venv needed.
-    # Only fires for pinned versions; unversioned specs skip (OSV returns all-time CVEs).
-    passed, reason = _osv_check_packages(packages)
+    # Snyk vulnerability check — real SNYK-PYTHON-xxx IDs via snyk auth.
+    # exit 2 (can't resolve) is also a hard block; suggests latest stable version.
+    passed, reason = _snyk_test_packages(packages, workspace)
     if not passed:
-        _log(f"BLOCKED ({context}) — OSV advisories for {packages}")
+        _log(f"BLOCKED ({context}) — Snyk: {reason[:80]}")
         _deny(
-            f"{context} blocked: {reason}",
+            f"{context} blocked by Snyk: {reason}",
             f"INSTALL BLOCKED ({context}): {reason}\nFix the version constraints, then retry.",
         )
         return False
-
-    # Snyk transitive-dep scanning is intentionally skipped here: it requires a
-    # resolved pip graph and flags transitive/license issues too noisy for a
-    # pre-install gate.  Snyk remains active in Gate 1 (notebook code scan).
 
     _log(f"allowed ({context}) — all checks passed for {packages}")
     return True

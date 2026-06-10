@@ -680,15 +680,47 @@ def _osv_check_packages(packages: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
+def _pypi_latest_version(pkg_name: str) -> str | None:
+    """Return the latest non-yanked stable version of a package from PyPI."""
+    try:
+        url = f"https://pypi.org/pypi/{urllib.parse.quote(pkg_name)}/json"
+        req = urllib.request.Request(url, headers={"User-Agent": "snyk-pip-gate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        releases = data.get("releases", {})
+        candidates = []
+        for ver, files in releases.items():
+            if not files:
+                continue
+            if all(f.get("yanked") for f in files):
+                continue
+            try:
+                parts = [int(x) for x in ver.split(".")[:3]]
+                candidates.append((parts, ver))
+            except ValueError:
+                pass
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
 def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
     """
-    Run ``snyk test`` as a supplementary check.
-    Returns (passed, failure_reason). Fails open if snyk is unavailable or
-    if pip can't resolve the package graph (422 / exit 2).
+    Run ``snyk test --json`` against a temp requirements file.
+    Parses JSON to report only security vulnerabilities (not license issues).
+    - exit 0  → allow
+    - exit 1  → hard block with SNYK-PYTHON-xxx IDs
+    - exit 2  → Snyk could not verify (pip can't resolve) → hard block, suggest latest stable
     """
     snyk = shutil.which("snyk")
     if not snyk:
-        return True, ""
+        return False, "Snyk CLI not found on PATH — cannot verify package safety."
+
+    venv_python = Path(cwd) / ".venv" / "bin" / "python3"
+    python_cmd = str(venv_python) if venv_python.exists() else sys.executable
 
     snyk_timeout = int(os.environ.get("COPILOT_PRETOOL_SNYK_TIMEOUT", "300"))
     tmp_path: str | None = None
@@ -702,7 +734,7 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
 
         r = subprocess.run(
             [snyk, "test", f"--file={tmp_path}", "--package-manager=pip",
-             f"--command={sys.executable}"],
+             f"--command={python_cmd}", "--json"],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -710,8 +742,8 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
         )
     except subprocess.TimeoutExpired:
         return False, f"Snyk test timed out after {snyk_timeout}s."
-    except OSError:
-        return True, ""
+    except OSError as e:
+        return False, f"Snyk could not run: {e}"
     finally:
         if tmp_path:
             try:
@@ -722,13 +754,40 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
     if r.returncode == 0:
         return True, ""
 
-    # exit 2 = Snyk couldn't resolve the dep graph (native extensions, auth issues, etc.)
-    # Fall back to OSV result rather than hard-blocking on infra errors.
     if r.returncode != 1:
-        return True, ""
+        # Snyk could not resolve the dep graph (e.g. package has native build requirements).
+        # Hard block and suggest the latest stable version as a safer alternative.
+        suggestions: list[str] = []
+        for spec in packages:
+            name = _strip_pkg_name(spec)
+            latest = _pypi_latest_version(name)
+            if latest:
+                suggestions.append(f"pip install {name}=={latest}")
+        hint = ("\nTry the latest stable version instead:\n  " + "\n  ".join(suggestions)
+                if suggestions else "")
+        return False, f"Snyk could not verify this package (dependency resolution failed).{hint}"
 
-    tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
-    return False, f"Snyk test found issues:\n{tail}"
+    try:
+        data = json.loads(r.stdout)
+        vulns = [v for v in data.get("vulnerabilities", [])
+                 if v.get("type") != "license"]
+        if not vulns:
+            return True, ""
+        lines: list[str] = []
+        seen: set[str] = set()
+        for v in vulns:
+            vid = v.get("id", "")
+            if vid in seen:
+                continue
+            seen.add(vid)
+            sev = v.get("severity", "").upper()
+            title = v.get("title", "vulnerability")
+            pkg = v.get("packageName", "")
+            lines.append(f"  • [{sev}] {vid} in {pkg}: {title}")
+        return False, "Snyk found security vulnerabilities:\n" + "\n".join(lines[:10])
+    except Exception:
+        tail = (r.stdout or r.stderr or "")[-1000:]
+        return False, f"Snyk test found issues:\n{tail}"
 
 
 def _run_pip_gate_checks(packages: list[str], cwd: str, context: str = "pip install") -> None:
@@ -769,16 +828,11 @@ def _run_pip_gate_checks(packages: list[str], cwd: str, context: str = "pip inst
         _deny(msg)
         return
 
-    # 2. OSV advisory check (works pre-install, no local env needed).
-    # Only fires for pinned versions; unversioned specs skip (OSV returns all-time CVEs).
-    passed, reason = _osv_check_packages(packages)
+    # 2. Snyk vulnerability check — real SNYK-PYTHON-xxx IDs via snyk auth.
+    # exit 2 (can't resolve) is also a hard block; suggests latest stable version.
+    passed, reason = _snyk_test_packages(packages, cwd)
     if not passed:
-        _deny(f"{context} blocked by OSV: {reason}")
-        return
-
-    # Snyk transitive-dep scanning is intentionally skipped here: it requires a
-    # resolved pip graph and flags transitive/license issues that are too noisy for
-    # a pre-install gate.  Snyk remains active in Gate 1 (notebook code scan).
+        _deny(f"{context} blocked by Snyk: {reason}")
 
 
 def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
