@@ -9,35 +9,34 @@ GATE 1 — Notebook execution gate (always enforced, non-negotiable order):
     1. Resolve the target ``.ipynb`` path from the tool payload (best-effort).
     2. **Export** — ``python -m nbconvert --to python <notebook.ipynb>`` (fresh
        export every time so the ``.py`` matches the notebook on disk).
-    3. **Scan** — ``snyk code test`` on the sibling ``.py`` (Snyk CLI must be on
-       ``PATH``; exit code 0 required).
+    3. **Pip cell scan** — if .cursor/enable-snyk-pip-gate exists, finds any
+       %pip/%!pip install cells in the exported .py and runs the same age +
+       vulnerability checks as Gate 2. Blocks if any cell would install a
+       too-new or vulnerable package, with a suggested safe version.
+    4. **Snyk Code scan** — ``snyk code test`` on the exported ``.py``.
 
-  Only if both steps succeed does the hook return without denying (the blocked
-  execution tool then proceeds). If nbconvert fails, Snyk is missing, or Snyk
-  reports issues, the tool call is **denied** with a short reason.
-
-  Optional env overrides (seconds):
-    ``COPILOT_PRETOOL_NBCONVERT_TIMEOUT`` (default 120),
-    ``COPILOT_PRETOOL_SNYK_TIMEOUT`` (default 300).
-
-  On a clean scan, a small voucher file is written under the system temp dir
-  (``<tempdir>/.snyk-nb-scan-ok.<sha256-hex16-of-resolved-nb-path>``) for
-  optional cross-tool bookkeeping. **Export and Snyk Code run only in this hook.**
+  All four steps must pass before notebook execution is allowed.
 
 GATE 2 — pip install gate (enforced when .cursor/enable-snyk-pip-gate exists):
-  Before any pip install, the hook autonomously runs two checks in order:
+  Before any pip install (via a shell tool), the hook autonomously runs:
 
     1. **PyPI release-age check** — queries pypi.org/pypi/<pkg>/json and blocks
        packages whose latest (or pinned) version was published within the last
-       24 hours (configurable via SNYK_PIP_GATE_MAX_AGE_HOURS). This catches
-       typosquatting and dependency-confusion packages before they can be installed.
+       24 hours (SNYK_PIP_GATE_MAX_AGE_HOURS). Also finds the newest version
+       older than the threshold so the agent can retry with a safe pin.
 
     2. **Snyk open-source test** — runs ``snyk test`` on a temporary requirements
-       file containing the requested packages. Blocks if Snyk reports known
-       vulnerabilities (exit 1).
+       file. Blocks on exit 1 (known vulnerabilities).
 
-  No human-in-the-loop voucher step is needed; both checks run inline and the
-  install is allowed only when both pass.
+  On a too-new block the deny message includes a ``pip install pkg==X.Y.Z``
+  retry command so the agent can immediately switch to the safe version.
+  On a Snyk block the deny message includes Snyk's output (which often names
+  the fixed version).
+
+Env overrides:
+  SNYK_PIP_GATE_MAX_AGE_HOURS   — recency threshold (default 24)
+  COPILOT_PRETOOL_NBCONVERT_TIMEOUT — nbconvert timeout seconds (default 120)
+  COPILOT_PRETOOL_SNYK_TIMEOUT  — snyk timeout seconds (default 300)
 
 Payload support:
   Both camelCase (toolName/toolArgs) and VS Code-compatible snake_case
@@ -93,8 +92,18 @@ _TOOLNAME_NOTEBOOK_EXEC = re.compile(
 
 _NB_PATH_KEYS = ("path", "notebook", "input", "input_path", "notebook_path", "file", "filePath", "file_path")
 
-# Strips version specifiers and extras so we can extract the bare package name
+# Strips version specifiers and extras to extract the bare package name
 _PKG_NAME_STRIP_RE = re.compile(r"[=<>!~\[\]@;].*$")
+
+# Patterns nbconvert produces for %pip and !pip magic cells
+_NB_PIP_LINE_MAGIC_RE = re.compile(
+    r"""run_line_magic\s*\(\s*['"]pip['"]\s*,\s*['"](install[^'"]*)['"]\s*\)""",
+    re.I,
+)
+_NB_SYSTEM_PIP_RE = re.compile(
+    r"""\.system\s*\(\s*['"]((?:!pip3?|pip3?)\s+install[^'"]*)['"]\s*\)""",
+    re.I,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +155,7 @@ def _workspace_root(start: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Gate 1 — notebook execution (export + Snyk before allow)
+# Gate 1 — notebook execution (export + pip cell scan + Snyk Code)
 # ---------------------------------------------------------------------------
 
 
@@ -205,10 +214,35 @@ def _extract_nb_path(cwd: str, tool_name: str, tool_args: dict) -> str | None:
     return None
 
 
+def _extract_pip_installs_from_py(py: Path) -> list[str]:
+    """
+    Find pip install commands embedded in an nbconvert-exported .py.
+    nbconvert converts ``%pip install foo`` → ``run_line_magic('pip', 'install foo')``
+    and ``!pip install foo``  → ``.system('pip install foo')``.
+    Returns a list of normalised ``pip install ...`` command strings.
+    """
+    try:
+        content = py.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    commands: list[str] = []
+
+    for m in _NB_PIP_LINE_MAGIC_RE.finditer(content):
+        arg = m.group(1).strip()  # e.g. 'install numpy pandas'
+        commands.append(f"pip {arg}")
+
+    for m in _NB_SYSTEM_PIP_RE.finditer(content):
+        cmd = m.group(1).lstrip("!")
+        commands.append(cmd.strip())
+
+    return commands
+
+
 def _export_and_snyk_scan_before_notebook_execution(cwd: str, tool_name: str, tool_args: dict) -> bool:
     """
-    Run nbconvert then snyk code test before allowing notebook execution.
-    Returns True if the tool call may proceed; False if denied.
+    Run nbconvert, optionally check pip cells, then snyk code test before
+    allowing notebook execution. Returns True to proceed; False if denied.
     """
     nb_path_str = _extract_nb_path(cwd, tool_name, tool_args)
     if not nb_path_str:
@@ -261,6 +295,41 @@ def _export_and_snyk_scan_before_notebook_execution(cwd: str, tool_name: str, to
         _deny("Notebook execution blocked: nbconvert succeeded but the expected .py export is missing.")
         return False
 
+    # Run pip gate checks on any %pip / !pip install cells inside the notebook.
+    # This closes the gap where an agent runs the full notebook and a cell
+    # installs a package that bypasses the shell-tool pip gate.
+    if _pip_gate_enabled(cwd):
+        pip_cmds = _extract_pip_installs_from_py(py)
+        for cmd in pip_cmds:
+            pkgs = _parse_pip_packages(cmd)
+            if not pkgs:
+                continue
+            max_age = float(os.environ.get("SNYK_PIP_GATE_MAX_AGE_HOURS", "24"))
+            too_new_lines: list[str] = []
+            for spec in pkgs:
+                age, safe_ver = _pypi_check(spec, max_age)
+                if age is not None and age < max_age:
+                    entry = f"{_strip_pkg_name(spec)} (released {age:.1f}h ago)"
+                    if safe_ver:
+                        entry += f" → use =={safe_ver}"
+                    too_new_lines.append(entry)
+            if too_new_lines:
+                _deny(
+                    "Notebook execution blocked: notebook cell(s) contain pip install "
+                    "commands with packages released within the last "
+                    f"{max_age:.0f} hours:\n"
+                    + "\n".join(f"  • {l}" for l in too_new_lines)
+                    + "\nPin a safe version or remove the cell before executing."
+                )
+                return False
+            passed, reason = _snyk_test_packages(pkgs, cwd)
+            if not passed:
+                _deny(
+                    "Notebook execution blocked: notebook cell(s) contain pip install "
+                    f"commands with known vulnerabilities.\n{reason}"
+                )
+                return False
+
     snyk = shutil.which("snyk")
     if not snyk:
         _deny(
@@ -302,7 +371,7 @@ def _export_and_snyk_scan_before_notebook_execution(cwd: str, tool_name: str, to
 
 
 # ---------------------------------------------------------------------------
-# Gate 2 — pip install (autonomous: PyPI age + inline snyk test)
+# Gate 2 — pip install (autonomous: PyPI age + safe-version suggestion + Snyk)
 # ---------------------------------------------------------------------------
 
 
@@ -367,16 +436,19 @@ def _strip_pkg_name(spec: str) -> str:
     return _PKG_NAME_STRIP_RE.sub("", spec).strip()
 
 
-def _pypi_release_age_hours(spec: str) -> float | None:
+def _pypi_check(spec: str, max_age_hours: float) -> tuple[float | None, str | None]:
     """
-    Query PyPI for the latest (or pinned) version of a package and return how
-    many hours ago it was first published. Returns None on any error (fail-open).
+    Single PyPI API call that returns (age_hours, safe_version).
+
+    age_hours: hours since the target version was first uploaded. None on error.
+    safe_version: the newest non-yanked version older than max_age_hours that the
+                  agent can pin instead, or None if no such version exists or the
+                  package is not too new.
     """
     pkg_name = _strip_pkg_name(spec)
     if not pkg_name:
-        return None
+        return None, None
 
-    # Extract pinned version if present, e.g. 'numpy==1.26.0' → '1.26.0'
     pinned: str | None = None
     pin_m = re.search(r"==\s*([^\s,;]+)", spec)
     if pin_m:
@@ -388,33 +460,61 @@ def _pypi_release_age_hours(spec: str) -> float | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+        return None, None
 
-    version = pinned or (data.get("info") or {}).get("version")
-    if not version:
-        return None
+    now = datetime.now(timezone.utc)
 
-    releases = (data.get("releases") or {}).get(version, [])
-    if not releases:
-        return None
+    def _parse_dt(t: str) -> datetime | None:
+        try:
+            normalized = t.replace("Z", "+00:00")
+            if "+" not in normalized and "-" not in normalized[10:]:
+                normalized += "+00:00"
+            return datetime.fromisoformat(normalized)
+        except (ValueError, OverflowError):
+            return None
 
-    upload_times: list[str] = []
-    for r in releases:
-        t = r.get("upload_time_iso_8601") or r.get("upload_time")
-        if t:
-            upload_times.append(t)
-    if not upload_times:
-        return None
+    def _earliest_upload(files: list[dict]) -> datetime | None:
+        times = [_parse_dt(f.get("upload_time_iso_8601") or f.get("upload_time") or "") for f in files]
+        valid = [t for t in times if t is not None]
+        return min(valid) if valid else None
 
-    earliest = min(upload_times)
-    try:
-        normalized = earliest.replace("Z", "+00:00")
-        if "+" not in normalized and "-" not in normalized[10:]:
-            normalized += "+00:00"
-        dt = datetime.fromisoformat(normalized)
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
-    except (ValueError, OverflowError):
-        return None
+    all_releases: dict = data.get("releases") or {}
+    target_ver = pinned or (data.get("info") or {}).get("version")
+    if not target_ver:
+        return None, None
+
+    target_files = all_releases.get(target_ver, [])
+    target_dt = _earliest_upload(target_files)
+    if target_dt is None:
+        return None, None
+
+    target_age = (now - target_dt).total_seconds() / 3600.0
+
+    if target_age >= max_age_hours:
+        # Already old enough — no safe-version search needed
+        return target_age, None
+
+    # Find the newest non-yanked version that is old enough
+    safe_candidates: list[tuple[str, datetime]] = []
+    for ver, files in all_releases.items():
+        if not files:
+            continue
+        # Skip yanked releases
+        if any(f.get("yanked") for f in files):
+            continue
+        dt = _earliest_upload(files)
+        if dt is None:
+            continue
+        age = (now - dt).total_seconds() / 3600.0
+        if age >= max_age_hours:
+            safe_candidates.append((ver, dt))
+
+    if not safe_candidates:
+        return target_age, None
+
+    # Sort by upload time descending → pick the most recent "safe" release
+    safe_candidates.sort(key=lambda x: x[1], reverse=True)
+    return target_age, safe_candidates[0][0]
 
 
 def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
@@ -464,9 +564,8 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
 
 def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
     """
-    Gate 2 entry point — runs autonomously on every pip install.
-    Order: PyPI age check first (fast, no subprocess), then Snyk (slower).
-    Calls _deny() if either check fails; returns silently to allow the install.
+    Gate 2 entry point. Blocks on too-new or vulnerable packages; provides an
+    auto-retry suggestion whenever a safe pinned version can be found.
     """
     if not _pip_gate_enabled(cwd):
         return
@@ -482,25 +581,40 @@ def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
 
     max_age_hours = float(os.environ.get("SNYK_PIP_GATE_MAX_AGE_HOURS", "24"))
 
-    # 1. PyPI release-age check — block packages too new to have been reviewed
-    too_new: list[str] = []
+    # 1. PyPI release-age check — block packages too new to have been reviewed.
+    #    For each blocked package, also surface the newest safe version so the
+    #    agent can immediately retry with a pinned spec.
+    too_new: list[tuple[str, float, str | None]] = []  # (pkg_name, age, safe_ver)
     for spec in packages:
-        age = _pypi_release_age_hours(spec)
+        age, safe_ver = _pypi_check(spec, max_age_hours)
         if age is not None and age < max_age_hours:
-            pkg_name = _strip_pkg_name(spec)
-            too_new.append(f"{pkg_name} (released {age:.1f}h ago)")
+            too_new.append((_strip_pkg_name(spec), age, safe_ver))
 
     if too_new:
-        _deny(
+        lines: list[str] = []
+        retry_specs: list[str] = []
+        for pkg_name, age, safe_ver in too_new:
+            line = f"  • {pkg_name} (released {age:.1f}h ago)"
+            if safe_ver:
+                line += f" — pin to =={safe_ver} instead"
+                retry_specs.append(f"{pkg_name}=={safe_ver}")
+            else:
+                line += " — no safe version available yet"
+            lines.append(line)
+
+        msg = (
             "pip install blocked: the following package(s) were released within the last "
-            f"{max_age_hours:.0f} hours and may be malicious (typosquatting / dependency confusion):\n"
-            + "\n".join(f"  • {p}" for p in too_new)
-            + f"\nWait until the package has been published for at least "
-            f"{max_age_hours:.0f} hours, or set SNYK_PIP_GATE_MAX_AGE_HOURS to override."
+            f"{max_age_hours:.0f} hours and may be malicious:\n"
+            + "\n".join(lines)
         )
+        if retry_specs:
+            msg += f"\nRetry with: pip install {' '.join(retry_specs)}"
+        else:
+            msg += f"\nWait until the package(s) are at least {max_age_hours:.0f} hours old."
+        _deny(msg)
         return
 
-    # 2. Snyk open-source vulnerability check
+    # 2. Snyk open-source vulnerability check.
     passed, reason = _snyk_test_packages(packages, cwd)
     if not passed:
         _deny(

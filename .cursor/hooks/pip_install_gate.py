@@ -10,7 +10,10 @@ two autonomous checks in order — no human-in-the-loop voucher step required:
   1. PyPI release-age check — queries pypi.org for the package's publish date.
      Blocks any package whose latest (or pinned) version was released within
      the last 24 hours (configurable via SNYK_PIP_GATE_MAX_AGE_HOURS).
-     This catches typosquatting and dependency-confusion packages immediately.
+     When a package is too new, the hook also finds the newest non-yanked
+     version older than the threshold and includes a ``pip install pkg==X.Y.Z``
+     retry command in the deny message so the agent can immediately switch to
+     the safe version without human intervention.
 
   2. Snyk open-source vulnerability check — runs ``snyk test`` on a temporary
      requirements file. Blocks if Snyk reports known vulnerabilities (exit 1).
@@ -210,14 +213,18 @@ def _strip_pkg_name(spec: str) -> str:
 # PyPI release-age check
 # ---------------------------------------------------------------------------
 
-def _pypi_release_age_hours(spec: str) -> float | None:
+def _pypi_check(spec: str, max_age_hours: float) -> tuple[float | None, str | None]:
     """
-    Query PyPI for the latest (or pinned) version of a package and return how
-    many hours ago it was first published. Returns None on any error (fail-open).
+    Single PyPI API call that returns (age_hours, safe_version).
+
+    age_hours: hours since the target version was first uploaded. None on error.
+    safe_version: the newest non-yanked version older than max_age_hours that the
+                  agent can pin instead, or None if no such version exists or the
+                  package is not too new.
     """
     pkg_name = _strip_pkg_name(spec)
     if not pkg_name:
-        return None
+        return None, None
 
     pinned: str | None = None
     pin_m = re.search(r"==\s*([^\s,;]+)", spec)
@@ -230,33 +237,52 @@ def _pypi_release_age_hours(spec: str) -> float | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
+        return None, None
 
-    version = pinned or (data.get("info") or {}).get("version")
-    if not version:
-        return None
+    now = datetime.now(timezone.utc)
 
-    releases = (data.get("releases") or {}).get(version, [])
-    if not releases:
-        return None
+    def _parse_dt(t: str) -> datetime | None:
+        try:
+            normalized = t.replace("Z", "+00:00")
+            if "+" not in normalized and "-" not in normalized[10:]:
+                normalized += "+00:00"
+            return datetime.fromisoformat(normalized)
+        except (ValueError, OverflowError):
+            return None
 
-    upload_times: list[str] = []
-    for r in releases:
-        t = r.get("upload_time_iso_8601") or r.get("upload_time")
-        if t:
-            upload_times.append(t)
-    if not upload_times:
-        return None
+    def _earliest_upload(files: list) -> datetime | None:
+        times = [_parse_dt(f.get("upload_time_iso_8601") or f.get("upload_time") or "") for f in files]
+        valid = [t for t in times if t is not None]
+        return min(valid) if valid else None
 
-    earliest = min(upload_times)
-    try:
-        normalized = earliest.replace("Z", "+00:00")
-        if "+" not in normalized and "-" not in normalized[10:]:
-            normalized += "+00:00"
-        dt = datetime.fromisoformat(normalized)
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
-    except (ValueError, OverflowError):
-        return None
+    all_releases: dict = data.get("releases") or {}
+    target_ver = pinned or (data.get("info") or {}).get("version")
+    if not target_ver:
+        return None, None
+
+    target_dt = _earliest_upload(all_releases.get(target_ver, []))
+    if target_dt is None:
+        return None, None
+
+    target_age = (now - target_dt).total_seconds() / 3600.0
+
+    if target_age >= max_age_hours:
+        return target_age, None
+
+    # Find the newest non-yanked version that is old enough
+    safe_candidates: list[tuple[str, datetime]] = []
+    for ver, files in all_releases.items():
+        if not files or any(f.get("yanked") for f in files):
+            continue
+        dt = _earliest_upload(files)
+        if dt is not None and (now - dt).total_seconds() / 3600.0 >= max_age_hours:
+            safe_candidates.append((ver, dt))
+
+    if not safe_candidates:
+        return target_age, None
+
+    safe_candidates.sort(key=lambda x: x[1], reverse=True)
+    return target_age, safe_candidates[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -332,30 +358,40 @@ def _handle_before_shell(data: dict, workspace: str) -> None:
 
     max_age_hours = float(os.environ.get("SNYK_PIP_GATE_MAX_AGE_HOURS", "24"))
 
-    # 1. PyPI release-age check
-    too_new: list[str] = []
+    # 1. PyPI release-age check — also surface the newest safe version to pin
+    too_new: list[tuple[str, float, str | None]] = []  # (pkg_name, age, safe_ver)
     for spec in packages:
-        age = _pypi_release_age_hours(spec)
-        _debug(f"{spec}: age={age}")
+        age, safe_ver = _pypi_check(spec, max_age_hours)
+        _debug(f"{spec}: age={age} safe_ver={safe_ver}")
         if age is not None and age < max_age_hours:
-            pkg_name = _strip_pkg_name(spec)
-            too_new.append(f"{pkg_name} (released {age:.1f}h ago)")
+            too_new.append((_strip_pkg_name(spec), age, safe_ver))
 
     if too_new:
-        summary = "\n".join(f"  • {p}" for p in too_new)
-        msg = (
-            f"Install blocked: {len(too_new)} package(s) released within the last "
-            f"{max_age_hours:.0f} hours — possible typosquatting or dependency confusion.\n{summary}"
+        lines: list[str] = []
+        retry_specs: list[str] = []
+        for pkg_name, age, safe_ver in too_new:
+            line = f"  • {pkg_name} (released {age:.1f}h ago)"
+            if safe_ver:
+                line += f" — pin to =={safe_ver} instead"
+                retry_specs.append(f"{pkg_name}=={safe_ver}")
+            else:
+                line += " — no safe version available yet"
+            lines.append(line)
+
+        summary = "\n".join(lines)
+        retry_hint = (
+            f"Retry with: pip install {' '.join(retry_specs)}"
+            if retry_specs
+            else f"Wait until the package(s) are at least {max_age_hours:.0f} hours old."
         )
-        _log(f"INSTALL BLOCKED — too-new packages: {too_new}")
+        _log(f"INSTALL BLOCKED — too-new packages: {[t[0] for t in too_new]}")
         _deny(
-            msg,
+            f"Install blocked: package(s) released within the last {max_age_hours:.0f} hours.\n"
+            f"{summary}\n{retry_hint}",
             (
                 f"INSTALL BLOCKED: the following package(s) were published within the last "
-                f"{max_age_hours:.0f} hours and cannot be installed until they have a longer "
-                f"publication history:\n{summary}\n"
-                "Wait for the recency window to pass, use a pinned older version, or set "
-                "SNYK_PIP_GATE_MAX_AGE_HOURS to adjust the threshold."
+                f"{max_age_hours:.0f} hours:\n{summary}\n{retry_hint}\n"
+                "Set SNYK_PIP_GATE_MAX_AGE_HOURS to adjust the threshold."
             ),
         )
         return
