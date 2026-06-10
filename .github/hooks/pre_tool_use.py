@@ -25,8 +25,19 @@ GATE 1 — Notebook execution gate (always enforced, non-negotiable order):
   optional cross-tool bookkeeping. **Export and Snyk Code run only in this hook.**
 
 GATE 2 — pip install gate (enforced when .cursor/enable-snyk-pip-gate exists):
-  Before any pip install, snyk_package_health_check must be called for each
-  package. After a health check a one-shot voucher allows the next install.
+  Before any pip install, the hook autonomously runs two checks in order:
+
+    1. **PyPI release-age check** — queries pypi.org/pypi/<pkg>/json and blocks
+       packages whose latest (or pinned) version was published within the last
+       24 hours (configurable via SNYK_PIP_GATE_MAX_AGE_HOURS). This catches
+       typosquatting and dependency-confusion packages before they can be installed.
+
+    2. **Snyk open-source test** — runs ``snyk test`` on a temporary requirements
+       file containing the requested packages. Blocks if Snyk reports known
+       vulnerabilities (exit 1).
+
+  No human-in-the-loop voucher step is needed; both checks run inline and the
+  install is allowed only when both pass.
 
 Payload support:
   Both camelCase (toolName/toolArgs) and VS Code-compatible snake_case
@@ -43,6 +54,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -77,6 +92,9 @@ _TOOLNAME_NOTEBOOK_EXEC = re.compile(
 )
 
 _NB_PATH_KEYS = ("path", "notebook", "input", "input_path", "notebook_path", "file", "filePath", "file_path")
+
+# Strips version specifiers and extras so we can extract the bare package name
+_PKG_NAME_STRIP_RE = re.compile(r"[=<>!~\[\]@;].*$")
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +208,7 @@ def _extract_nb_path(cwd: str, tool_name: str, tool_args: dict) -> str | None:
 def _export_and_snyk_scan_before_notebook_execution(cwd: str, tool_name: str, tool_args: dict) -> bool:
     """
     Run nbconvert then snyk code test before allowing notebook execution.
-    Returns True if the tool call may proceed; False if denied (stderr already emitted).
+    Returns True if the tool call may proceed; False if denied.
     """
     nb_path_str = _extract_nb_path(cwd, tool_name, tool_args)
     if not nb_path_str:
@@ -284,23 +302,210 @@ def _export_and_snyk_scan_before_notebook_execution(cwd: str, tool_name: str, to
 
 
 # ---------------------------------------------------------------------------
-# Gate 2 — pip install
+# Gate 2 — pip install (autonomous: PyPI age + inline snyk test)
 # ---------------------------------------------------------------------------
-
-
-def _pip_gate_paths(cwd: str) -> tuple[Path, Path]:
-    h = _safe_hex(cwd)
-    base = Path(tempfile.gettempdir()) / f"copilot-pip-gate-{h}"
-    return (base.with_suffix(".pending"), base.with_suffix(".voucher"))
 
 
 def _pip_gate_enabled(cwd: str) -> bool:
     return (Path(cwd) / ".cursor" / "enable-snyk-pip-gate").is_file()
 
 
-def _is_health_check(tool_name: str, tool_args: dict) -> bool:
-    blob = (tool_name or "") + " " + json.dumps(tool_args, sort_keys=True)
-    return "snyk_package_health_check" in blob.lower()
+def _parse_pip_packages(command: str) -> list[str] | None:
+    """Return package specs from a pip install command, or None for complex invocations."""
+    m = re.match(
+        r"^(?:(?:python3?|py)\s+-m\s+pip|pip3?|%pip|!pip3?)\s+install\s+(.*)",
+        command.strip(), re.I | re.S,
+    )
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    if not rest:
+        return None
+
+    parts: list[str] = []
+    cur: list[str] = []
+    in_q: str | None = None
+    for ch in rest:
+        if in_q:
+            cur.append(ch)
+            if ch == in_q:
+                in_q = None
+            continue
+        if ch in "\"'":
+            in_q = ch
+            cur.append(ch)
+            continue
+        if ch.isspace() and cur:
+            parts.append("".join(cur))
+            cur = []
+        elif not ch.isspace():
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur))
+
+    reqs: list[str] = []
+    i = 0
+    while i < len(parts):
+        t = parts[i]
+        if t.startswith("-"):
+            if t in ("-r", "--requirement", "-e", "--editable"):
+                return None  # complex invocation — skip gate
+            if t in ("-c", "--constraint", "-f", "--find-links") and i + 1 < len(parts):
+                i += 2
+                continue
+            i += 1
+            continue
+        if "://" in t or t.startswith("git+"):
+            return None
+        reqs.append(t)
+        i += 1
+    return reqs if reqs else None
+
+
+def _strip_pkg_name(spec: str) -> str:
+    """Extract bare package name from a spec like 'numpy>=1.0' or 'pandas[excel]'."""
+    return _PKG_NAME_STRIP_RE.sub("", spec).strip()
+
+
+def _pypi_release_age_hours(spec: str) -> float | None:
+    """
+    Query PyPI for the latest (or pinned) version of a package and return how
+    many hours ago it was first published. Returns None on any error (fail-open).
+    """
+    pkg_name = _strip_pkg_name(spec)
+    if not pkg_name:
+        return None
+
+    # Extract pinned version if present, e.g. 'numpy==1.26.0' → '1.26.0'
+    pinned: str | None = None
+    pin_m = re.search(r"==\s*([^\s,;]+)", spec)
+    if pin_m:
+        pinned = pin_m.group(1).strip()
+
+    url = f"https://pypi.org/pypi/{urllib.parse.quote(pkg_name, safe='')}/json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "snyk-pip-gate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+
+    version = pinned or (data.get("info") or {}).get("version")
+    if not version:
+        return None
+
+    releases = (data.get("releases") or {}).get(version, [])
+    if not releases:
+        return None
+
+    upload_times: list[str] = []
+    for r in releases:
+        t = r.get("upload_time_iso_8601") or r.get("upload_time")
+        if t:
+            upload_times.append(t)
+    if not upload_times:
+        return None
+
+    earliest = min(upload_times)
+    try:
+        normalized = earliest.replace("Z", "+00:00")
+        if "+" not in normalized and "-" not in normalized[10:]:
+            normalized += "+00:00"
+        dt = datetime.fromisoformat(normalized)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    except (ValueError, OverflowError):
+        return None
+
+
+def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
+    """
+    Run ``snyk test`` against a temporary requirements file.
+    Returns (passed, failure_reason). Fails open if snyk is unavailable.
+    """
+    snyk = shutil.which("snyk")
+    if not snyk:
+        return True, ""
+
+    snyk_timeout = int(os.environ.get("COPILOT_PRETOOL_SNYK_TIMEOUT", "300"))
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix="-req.txt", delete=False, encoding="utf-8"
+        ) as f:
+            for pkg in packages:
+                f.write(pkg.strip() + "\n")
+            tmp_path = f.name
+
+        r = subprocess.run(
+            [snyk, "test", f"--file={tmp_path}", "--package-manager=pip",
+             f"--command={sys.executable}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=snyk_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Snyk test timed out after {snyk_timeout}s."
+    except OSError:
+        return True, ""  # fail-open if snyk can't run
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if r.returncode == 0:
+        return True, ""
+
+    tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
+    return False, f"Snyk test found issues (exit {r.returncode}):\n{tail}"
+
+
+def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:
+    """
+    Gate 2 entry point — runs autonomously on every pip install.
+    Order: PyPI age check first (fast, no subprocess), then Snyk (slower).
+    Calls _deny() if either check fails; returns silently to allow the install.
+    """
+    if not _pip_gate_enabled(cwd):
+        return
+
+    command = _shell_command(tool_name, tool_args) or str(tool_args.get("command") or "")
+    if not command or not _PIP_RE.search(command):
+        return
+
+    packages = _parse_pip_packages(command)
+    if packages is None:
+        # Complex invocation (requirements file, VCS URL, editable) — skip gate
+        return
+
+    max_age_hours = float(os.environ.get("SNYK_PIP_GATE_MAX_AGE_HOURS", "24"))
+
+    # 1. PyPI release-age check — block packages too new to have been reviewed
+    too_new: list[str] = []
+    for spec in packages:
+        age = _pypi_release_age_hours(spec)
+        if age is not None and age < max_age_hours:
+            pkg_name = _strip_pkg_name(spec)
+            too_new.append(f"{pkg_name} (released {age:.1f}h ago)")
+
+    if too_new:
+        _deny(
+            "pip install blocked: the following package(s) were released within the last "
+            f"{max_age_hours:.0f} hours and may be malicious (typosquatting / dependency confusion):\n"
+            + "\n".join(f"  • {p}" for p in too_new)
+            + f"\nWait until the package has been published for at least "
+            f"{max_age_hours:.0f} hours, or set SNYK_PIP_GATE_MAX_AGE_HOURS to override."
+        )
+        return
+
+    # 2. Snyk open-source vulnerability check
+    passed, reason = _snyk_test_packages(packages, cwd)
+    if not passed:
+        _deny(
+            f"pip install blocked by Snyk: known vulnerabilities found in requested packages.\n{reason}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -321,43 +526,10 @@ def main() -> None:
         if not _export_and_snyk_scan_before_notebook_execution(cwd, tool_name, tool_args):
             return
 
-    if not _pip_gate_enabled(cwd):
-        return
-
-    pending_path, voucher_path = _pip_gate_paths(cwd)
-
-    if _is_health_check(tool_name, tool_args):
-        try:
-            if pending_path.exists():
-                pending_path.unlink()
-            voucher_path.touch(exist_ok=True)
-        except OSError:
-            pass
-        return
-
     if tool_name.lower() not in _SHELL_TOOLS:
         return
 
-    command = _shell_command(tool_name, tool_args) or str(tool_args.get("command") or "")
-    if not command or not _PIP_RE.search(command):
-        return
-
-    if voucher_path.exists():
-        try:
-            voucher_path.unlink()
-        except OSError:
-            pass
-        return
-
-    try:
-        pending_path.write_text(command[:2000], encoding="utf-8")
-    except OSError:
-        pass
-
-    _deny(
-        "pip install is blocked by policy. Run `snyk_package_health_check` for each package "
-        "(ecosystem: pypi) first, then retry the install."
-    )
+    _check_pip_install(cwd, tool_name, tool_args)
 
 
 if __name__ == "__main__":

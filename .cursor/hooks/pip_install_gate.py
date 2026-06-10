@@ -4,29 +4,30 @@ Cursor Hook: Snyk Package Health Gate for pip installs in Jupyter notebooks.
 
 WORKFLOW
 --------
-1. Agent proposes a pip install command (in notebook or shell).
-   → beforeShellExecution: BLOCKS the install, tells agent to run
-     snyk_package_health_check first and records a pending-state file.
-2. Agent runs snyk_package_health_check (MCP).
-   → beforeMCPExecution: detects the scan tool, clears the pending state.
-3. Install is retried → a one-shot **voucher** file allows that install; the next
-   pip install again requires a fresh health check.
-4. Session ends with unscanned pending state → stop: emits followup reminder.
+When a pip install command is detected (beforeShellExecution), the hook runs
+two autonomous checks in order — no human-in-the-loop voucher step required:
+
+  1. PyPI release-age check — queries pypi.org for the package's publish date.
+     Blocks any package whose latest (or pinned) version was released within
+     the last 24 hours (configurable via SNYK_PIP_GATE_MAX_AGE_HOURS).
+     This catches typosquatting and dependency-confusion packages immediately.
+
+  2. Snyk open-source vulnerability check — runs ``snyk test`` on a temporary
+     requirements file. Blocks if Snyk reports known vulnerabilities (exit 1).
+
+Only when both checks pass is the install allowed.
 
 Enable the gate by creating the flag file:
   .cursor/enable-snyk-pip-gate   (empty file)
 
 Without that flag the hook exits 0 / allow for all events (fail-open).
 
-HOOKS.JSON wiring (all four events must point here):
-  "afterFileEdit"        → not used by this gate; leave for nbconvert hook
+HOOKS.JSON wiring:
   "beforeShellExecution" → python3 .cursor/hooks/pip_install_gate.py
-  "beforeMCPExecution"   → python3 .cursor/hooks/pip_install_gate.py
   "stop"                 → python3 .cursor/hooks/pip_install_gate.py
 
-State and voucher files live under `tempfile.gettempdir()`, keyed by a hash of
-the workspace path.
 Set CURSOR_HOOK_DEBUG=1 for verbose stderr output.
+Set SNYK_PIP_GATE_MAX_AGE_HOURS to override the 24-hour recency threshold.
 """
 from __future__ import annotations
 
@@ -38,7 +39,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -47,11 +51,6 @@ from pathlib import Path
 
 DEBUG = os.environ.get("CURSOR_HOOK_DEBUG", "0") == "1"
 
-
-
-# MCP tool name that satisfies the gate
-HEALTH_CHECK_TOOL = "snyk_package_health_check"
-
 # pip patterns that trigger the gate
 _PIP_RE = re.compile(
     r"^(?:python3?|py)\s+-m\s+pip\s+install\b|^pip3?\s+install\b|"
@@ -59,14 +58,15 @@ _PIP_RE = re.compile(
     re.I,
 )
 
+# Strips version specifiers and extras so we can extract the bare package name
+_PKG_NAME_STRIP_RE = re.compile(r"[=<>!~\[\]@;].*$")
+
+_HEX_RE = re.compile(r"^[0-9a-f]+$")
+
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-
-def _truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
 
 def _debug(msg: str) -> None:
     if DEBUG:
@@ -94,21 +94,11 @@ def _deny(user_msg: str, agent_msg: str) -> None:
     sys.exit(2)
 
 
-def _ask(user_msg: str, agent_msg: str) -> None:
-    _out({
-        "permission": "ask",
-        "continue": True,
-        "user_message": user_msg,
-        "agent_message": agent_msg,
-    })
-
-
 # ---------------------------------------------------------------------------
-# State file helpers (workspace-scoped)
+# Workspace helpers
 # ---------------------------------------------------------------------------
 
 def _validated_abspath(raw: str) -> str | None:
-    """Resolve raw to an absolute path; return None if result is not absolute."""
     if not raw:
         return None
     resolved = os.path.realpath(raw)
@@ -134,67 +124,11 @@ def _workspace(data: dict) -> str:
     return os.getcwd()
 
 
-_HEX_RE = re.compile(r"^[0-9a-f]+$")
-
-
 def _safe_hex(value: str) -> str:
-    """Return a hex digest of value, validated to contain only hex characters.
-
-    The regex check acts as an explicit sanitiser so Snyk's taint engine can
-    recognise that no arbitrary user data flows into path construction.
-    """
     digest = hashlib.sha256(value.encode()).hexdigest()[:16]
     if not _HEX_RE.match(digest):
         raise ValueError("Unexpected non-hex characters in digest")
     return digest
-
-
-def _state_path(workspace: str) -> Path:
-    h = _safe_hex(workspace)
-    return Path(tempfile.gettempdir()) / ("cursor-pip-gate-" + h + ".state")
-
-
-def _pending(workspace: str) -> bool:
-    return _state_path(workspace).exists()
-
-
-def _read_state(workspace: str) -> str:
-    p = _state_path(workspace)
-    return p.read_text(encoding="utf-8").strip() if p.exists() else ""
-
-
-def _write_state(workspace: str, line: str) -> None:
-    with _state_path(workspace).open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    _debug(f"wrote state → {_state_path(workspace)}")
-
-
-def _clear_state(workspace: str) -> None:
-    p = _state_path(workspace)
-    if p.exists():
-        p.unlink()
-        _debug(f"cleared state → {p}")
-
-
-def _voucher_path(workspace: str) -> Path:
-    h = _safe_hex(workspace)
-    return Path(tempfile.gettempdir()) / ("cursor-pip-gate-" + h + ".voucher")
-
-
-def _has_voucher(workspace: str) -> bool:
-    return _voucher_path(workspace).is_file()
-
-
-def _consume_voucher(workspace: str) -> None:
-    p = _voucher_path(workspace)
-    if p.exists():
-        p.unlink()
-        _debug(f"consumed voucher → {p}")
-
-
-def _grant_voucher(workspace: str) -> None:
-    _voucher_path(workspace).touch()
-    _debug(f"granted voucher → {_voucher_path(workspace)}")
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +149,7 @@ def _is_pip_install(command: str) -> bool:
 
 
 def _parse_packages(command: str) -> list[str] | None:
-    """Return simple package specs from a pip install command, or None to skip gate."""
+    """Return package specs from a pip install command, or None for complex invocations."""
     s = command.strip()
     m = re.match(
         r"^(?:(?:python3?|py)\s+-m\s+pip|pip3?|%pip|!pip3?)\s+install\s+(.*)",
@@ -227,7 +161,6 @@ def _parse_packages(command: str) -> list[str] | None:
     if not rest:
         return None
 
-    # Tokenise respecting basic quoting
     parts: list[str] = []
     cur: list[str] = []
     in_q: str | None = None
@@ -268,6 +201,115 @@ def _parse_packages(command: str) -> list[str] | None:
     return reqs if reqs else None
 
 
+def _strip_pkg_name(spec: str) -> str:
+    """Extract bare package name from a spec like 'numpy>=1.0' or 'pandas[excel]'."""
+    return _PKG_NAME_STRIP_RE.sub("", spec).strip()
+
+
+# ---------------------------------------------------------------------------
+# PyPI release-age check
+# ---------------------------------------------------------------------------
+
+def _pypi_release_age_hours(spec: str) -> float | None:
+    """
+    Query PyPI for the latest (or pinned) version of a package and return how
+    many hours ago it was first published. Returns None on any error (fail-open).
+    """
+    pkg_name = _strip_pkg_name(spec)
+    if not pkg_name:
+        return None
+
+    pinned: str | None = None
+    pin_m = re.search(r"==\s*([^\s,;]+)", spec)
+    if pin_m:
+        pinned = pin_m.group(1).strip()
+
+    url = f"https://pypi.org/pypi/{urllib.parse.quote(pkg_name, safe='')}/json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "snyk-pip-gate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+
+    version = pinned or (data.get("info") or {}).get("version")
+    if not version:
+        return None
+
+    releases = (data.get("releases") or {}).get(version, [])
+    if not releases:
+        return None
+
+    upload_times: list[str] = []
+    for r in releases:
+        t = r.get("upload_time_iso_8601") or r.get("upload_time")
+        if t:
+            upload_times.append(t)
+    if not upload_times:
+        return None
+
+    earliest = min(upload_times)
+    try:
+        normalized = earliest.replace("Z", "+00:00")
+        if "+" not in normalized and "-" not in normalized[10:]:
+            normalized += "+00:00"
+        dt = datetime.fromisoformat(normalized)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    except (ValueError, OverflowError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Snyk open-source vulnerability check
+# ---------------------------------------------------------------------------
+
+def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]:
+    """
+    Run ``snyk test`` against a temporary requirements file.
+    Returns (passed, failure_reason). Fails open if snyk is unavailable.
+    """
+    snyk = shutil.which("snyk")
+    if not snyk:
+        _log("snyk not in PATH — skipping open-source vulnerability check")
+        return True, ""
+
+    snyk_timeout = int(os.environ.get("SNYK_PIP_GATE_SNYK_TIMEOUT", "120"))
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix="-req.txt", delete=False, encoding="utf-8"
+        ) as f:
+            for pkg in packages:
+                f.write(pkg.strip() + "\n")
+            tmp_path = f.name
+
+        r = subprocess.run(
+            [snyk, "test", f"--file={tmp_path}", "--package-manager=pip",
+             f"--command={sys.executable}"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=snyk_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Snyk test timed out after {snyk_timeout}s."
+    except OSError as e:
+        _log(f"snyk test could not run: {e}")
+        return True, ""  # fail-open
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if r.returncode == 0:
+        return True, ""
+
+    tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
+    return False, f"Snyk found vulnerabilities (exit {r.returncode}):\n{tail}"
+
+
 # ---------------------------------------------------------------------------
 # Hook handlers
 # ---------------------------------------------------------------------------
@@ -279,133 +321,64 @@ def _handle_before_shell(data: dict, workspace: str) -> None:
         return
 
     if not _gate_enabled(workspace):
-        # Gate disabled — fall back to optional snyk test (legacy behaviour)
-        _legacy_snyk_test(command, workspace)
-        return
-
-    # One-shot allow after snyk_package_health_check cleared the pending state.
-    if _has_voucher(workspace):
-        _consume_voucher(workspace)
-        _log("pip install allowed (health-check voucher consumed)")
         _allow()
         return
 
-    if _pending(workspace):
-        # Already blocked from a previous command; keep blocking
-        changes = _read_state(workspace)
-        _log("INSTALL BLOCKED — snyk_package_health_check not yet run")
+    packages = _parse_packages(command)
+    if packages is None:
+        # Complex invocation (requirements file, VCS URL, editable) — skip gate
+        _allow()
+        return
+
+    max_age_hours = float(os.environ.get("SNYK_PIP_GATE_MAX_AGE_HOURS", "24"))
+
+    # 1. PyPI release-age check
+    too_new: list[str] = []
+    for spec in packages:
+        age = _pypi_release_age_hours(spec)
+        _debug(f"{spec}: age={age}")
+        if age is not None and age < max_age_hours:
+            pkg_name = _strip_pkg_name(spec)
+            too_new.append(f"{pkg_name} (released {age:.1f}h ago)")
+
+    if too_new:
+        summary = "\n".join(f"  • {p}" for p in too_new)
+        msg = (
+            f"Install blocked: {len(too_new)} package(s) released within the last "
+            f"{max_age_hours:.0f} hours — possible typosquatting or dependency confusion.\n{summary}"
+        )
+        _log(f"INSTALL BLOCKED — too-new packages: {too_new}")
         _deny(
-            "Install blocked: run snyk_package_health_check for each package first.",
+            msg,
             (
-                "INSTALL BLOCKED: packages were proposed for install but "
-                "snyk_package_health_check has not been called yet for this session. "
-                f"Pending packages:\n{changes}\n"
-                "Call snyk_package_health_check (ecosystem='pypi', package_name=...) "
-                "for each package, then retry the install."
+                f"INSTALL BLOCKED: the following package(s) were published within the last "
+                f"{max_age_hours:.0f} hours and cannot be installed until they have a longer "
+                f"publication history:\n{summary}\n"
+                "Wait for the recency window to pass, use a pinned older version, or set "
+                "SNYK_PIP_GATE_MAX_AGE_HOURS to adjust the threshold."
             ),
         )
         return
 
-    # Record the install attempt as pending
-    packages = _parse_packages(command) or [command]
-    ts = datetime.now().isoformat(timespec="seconds")
-    for pkg in packages:
-        _write_state(workspace, f"{ts}: {pkg}")
-
-    _log("INSTALL BLOCKED — snyk_package_health_check required before install")
-    _deny(
-        "Install blocked: run snyk_package_health_check for each package first, then retry.",
-        (
-            f"INSTALL BLOCKED: you attempted to install {packages!r} without first "
-            "running snyk_package_health_check. You MUST call "
-            "snyk_package_health_check (ecosystem='pypi', package_name=<pkg>) for "
-            "each package before any pip/pip3/%pip/!pip install. "
-            "After all health checks pass, retry the install."
-        ),
-    )
-
-
-def _legacy_snyk_test(command: str, workspace: str) -> None:
-    """Fallback: run snyk test via CLI when gate flag is absent (original behaviour)."""
-    reqs = _parse_packages(command)
-    if not reqs:
-        _allow()
-        return
-
-    snyk = shutil.which("snyk")
-    if not snyk:
-        _log("snyk not in PATH — install CLI or remove .cursor/enable-snyk-pip-gate")
-        _allow()
-        return
-
-    tmp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix="-req.txt", delete=False, encoding="utf-8"
-        ) as f:
-            for line in reqs:
-                f.write(line.strip() + "\n")
-            tmp_path = f.name
-
-        r = subprocess.run(
-            [snyk, "test", f"--file={tmp_path}", f"--command={sys.executable}"],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
+    # 2. Snyk open-source vulnerability check
+    passed, reason = _snyk_test_packages(packages, workspace)
+    if not passed:
+        _log(f"INSTALL BLOCKED — Snyk found vulnerabilities in {packages}")
+        _deny(
+            f"Install blocked: Snyk found known vulnerabilities in the requested packages.\n{reason}",
+            (
+                f"INSTALL BLOCKED: Snyk reported vulnerabilities for {packages!r}.\n{reason}\n"
+                "Fix the version constraints to avoid vulnerable releases, then retry."
+            ),
         )
-    except OSError as e:
-        _log(f"snyk test failed: {e}")
-        _allow()
         return
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
-    if r.returncode == 0:
-        _allow()
-    elif r.returncode == 1:
-        _ask(
-            "Snyk reported dependency issues. Review and approve to continue.",
-            "Snyk `test` found issues. Confirm with the user or fix versions, then retry.",
-        )
-    else:
-        _log(f"snyk test error: {r.stderr or r.stdout}")
-        _allow()
-
-
-def _handle_before_mcp(data: dict, workspace: str) -> None:
-    tool_name = data.get("tool_name", "")
-    if HEALTH_CHECK_TOOL in tool_name.lower() and _pending(workspace):
-        changes = _read_state(workspace)
-        _clear_state(workspace)
-        _grant_voucher(workspace)
-        _log(f"snyk_package_health_check called — pip gate cleared. Was pending:\n{changes}")
-    _out({"exit_code": 0})
+    _log(f"pip install allowed — all checks passed for {packages}")
+    _allow()
 
 
 def _handle_stop(data: dict, workspace: str) -> None:
-    if not _pending(workspace):
-        _out({})
-        return
-    changes = _read_state(workspace)
-    _clear_state(workspace)
-    _consume_voucher(workspace)
-    _log("SESSION ENDED with unvetted pip installs pending (state cleared for next session)")
-    _out({
-        "followup_message": (
-            "Notebook / pip workflow: a `pip install` (or `%pip` / `!pip`) was blocked because "
-            "`snyk_package_health_check` had not been run yet for the listed package(s). "
-            "Pending lines from this session:\n"
-            f"{changes}\n\n"
-            "Next time: run **`snyk_package_health_check`** with `ecosystem: \"pypi\"` (and "
-            "`package_name` per package), then retry install. "
-            "The hook has **cleared** this pending state—your next session starts clean unless "
-            "another blocked install runs."
-        )
-    })
+    _out({})
 
 
 # ---------------------------------------------------------------------------
@@ -427,12 +400,9 @@ def main() -> None:
 
     if event == "beforeShellExecution":
         _handle_before_shell(data, workspace)
-    elif event == "beforeMCPExecution":
-        _handle_before_mcp(data, workspace)
     elif event == "stop":
         _handle_stop(data, workspace)
     else:
-        # afterFileEdit or unknown — no-op
         _out({"exit_code": 0})
 
 
