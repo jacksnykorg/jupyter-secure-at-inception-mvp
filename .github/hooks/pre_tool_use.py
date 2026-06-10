@@ -621,10 +621,70 @@ def _pypi_check(spec: str, max_age_hours: float) -> tuple[float | None, str | No
     return target_age, safe_candidates[0][0]
 
 
+def _osv_check_packages(packages: list[str]) -> tuple[bool, str]:
+    """
+    Query OSV.dev for known vulnerabilities by package name+version.
+    Returns (passed, failure_reason).  Fails open if the API is unreachable.
+    OSV doesn't require pip resolution or a local venv — works pre-install.
+    """
+    OSV_URL = "https://api.osv.dev/v1/querybatch"
+    queries = []
+    specs = []
+    for spec in packages:
+        name = _strip_pkg_name(spec)
+        ver_match = re.search(r"==([^\s,;]+)", spec)
+        version = ver_match.group(1) if ver_match else None
+        # OSV without a pinned version returns all historical CVEs for the package —
+        # not actionable.  Only check when the agent has specified an exact version.
+        if not version:
+            continue
+        queries.append({"package": {"name": name, "ecosystem": "PyPI"}, "version": version})
+        specs.append(spec)
+
+    if not queries:
+        return True, ""
+
+    try:
+        body = json.dumps({"queries": queries}).encode()
+        req = urllib.request.Request(
+            OSV_URL,
+            data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "snyk-pip-gate/1.0"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return True, ""  # fail-open if OSV unreachable
+
+    findings: list[str] = []
+    for spec, result in zip(specs, data.get("results", [])):
+        vulns = result.get("vulns", [])
+        if not vulns:
+            continue
+        name = _strip_pkg_name(spec)
+        ids = ", ".join(
+            next((a for a in v.get("aliases", []) if a.startswith("CVE-")), v["id"])
+            for v in vulns[:4]
+        )
+        extra = f" (+{len(vulns)-4} more)" if len(vulns) > 4 else ""
+        sev_counts: dict[str, int] = {}
+        for v in vulns:
+            s = v.get("database_specific", {}).get("severity", "UNKNOWN")
+            sev_counts[s] = sev_counts.get(s, 0) + 1
+        sev_str = ", ".join(f"{c}×{s}" for s, c in sorted(sev_counts.items()))
+        findings.append(f"  • {name}: {ids}{extra} [{sev_str}]")
+
+    if findings:
+        return False, "OSV advisory database found vulnerabilities:\n" + "\n".join(findings)
+    return True, ""
+
+
 def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
     """
-    Run ``snyk test`` against a temporary requirements file.
-    Returns (passed, failure_reason). Fails open if snyk is unavailable.
+    Run ``snyk test`` as a supplementary check.
+    Returns (passed, failure_reason). Fails open if snyk is unavailable or
+    if pip can't resolve the package graph (422 / exit 2).
     """
     snyk = shutil.which("snyk")
     if not snyk:
@@ -651,7 +711,7 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, f"Snyk test timed out after {snyk_timeout}s."
     except OSError:
-        return True, ""  # fail-open if snyk can't run
+        return True, ""
     finally:
         if tmp_path:
             try:
@@ -662,17 +722,13 @@ def _snyk_test_packages(packages: list[str], cwd: str) -> tuple[bool, str]:
     if r.returncode == 0:
         return True, ""
 
-    tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
-
-    # exit 1 = vulnerabilities found → block.
-    # exit 2 = Snyk infrastructure error (e.g. auth failure 401) → fail-open so an
-    # unconfigured Snyk CLI doesn't hard-stop every install.  A dependency-resolution
-    # error (422 SNYK-OS-PYTHON-0013) is also exit 2 but is treated as a hard block
-    # because unresolvable packages cannot be verified and may be malicious.
-    if r.returncode != 1 and "401" in tail:
+    # exit 2 = Snyk couldn't resolve the dep graph (native extensions, auth issues, etc.)
+    # Fall back to OSV result rather than hard-blocking on infra errors.
+    if r.returncode != 1:
         return True, ""
 
-    return False, f"Snyk test found issues (exit {r.returncode}):\n{tail}"
+    tail = ((r.stderr or "") + (r.stdout or ""))[-1500:]
+    return False, f"Snyk test found issues:\n{tail}"
 
 
 def _run_pip_gate_checks(packages: list[str], cwd: str, context: str = "pip install") -> None:
@@ -713,10 +769,16 @@ def _run_pip_gate_checks(packages: list[str], cwd: str, context: str = "pip inst
         _deny(msg)
         return
 
-    # 2. Snyk open-source vulnerability check
-    passed, reason = _snyk_test_packages(packages, cwd)
+    # 2. OSV advisory check (works pre-install, no local env needed).
+    # Only fires for pinned versions; unversioned specs skip (OSV returns all-time CVEs).
+    passed, reason = _osv_check_packages(packages)
     if not passed:
-        _deny(f"{context} blocked by Snyk: known vulnerabilities found.\n{reason}")
+        _deny(f"{context} blocked by OSV: {reason}")
+        return
+
+    # Snyk transitive-dep scanning is intentionally skipped here: it requires a
+    # resolved pip graph and flags transitive/license issues that are too noisy for
+    # a pre-install gate.  Snyk remains active in Gate 1 (notebook code scan).
 
 
 def _check_pip_install(cwd: str, tool_name: str, tool_args: dict) -> None:

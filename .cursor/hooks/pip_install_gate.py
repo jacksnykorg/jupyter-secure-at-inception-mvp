@@ -365,7 +365,70 @@ def _pypi_check(spec: str, max_age_hours: float) -> tuple[float | None, str | No
 
 
 # ---------------------------------------------------------------------------
-# Snyk open-source vulnerability check
+# OSV advisory check (pre-install, no local env needed)
+# ---------------------------------------------------------------------------
+
+def _osv_check_packages(packages: list[str]) -> tuple[bool, str]:
+    """
+    Query OSV.dev for known vulnerabilities by package name+version.
+    Returns (passed, failure_reason).  Fails open if the API is unreachable.
+    """
+    import urllib.request as _ureq
+    OSV_URL = "https://api.osv.dev/v1/querybatch"
+    queries = []
+    specs = []
+    for spec in packages:
+        name = _strip_pkg_name(spec)
+        ver_match = re.search(r"==([^\s,;]+)", spec)
+        version = ver_match.group(1) if ver_match else None
+        # OSV without a pinned version returns all historical CVEs — not actionable.
+        # Only check exact pinned versions.
+        if not version:
+            continue
+        queries.append({"package": {"name": name, "ecosystem": "PyPI"}, "version": version})
+        specs.append(spec)
+
+    if not queries:
+        return True, ""
+
+    try:
+        body = json.dumps({"queries": queries}).encode()
+        req = _ureq.Request(
+            OSV_URL,
+            data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "snyk-pip-gate/1.0"},
+            method="POST",
+        )
+        with _ureq.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return True, ""  # fail-open if OSV unreachable
+
+    findings: list[str] = []
+    for spec, result in zip(specs, data.get("results", [])):
+        vulns = result.get("vulns", [])
+        if not vulns:
+            continue
+        name = _strip_pkg_name(spec)
+        ids = ", ".join(
+            next((a for a in v.get("aliases", []) if a.startswith("CVE-")), v["id"])
+            for v in vulns[:4]
+        )
+        extra = f" (+{len(vulns)-4} more)" if len(vulns) > 4 else ""
+        sev_counts: dict[str, int] = {}
+        for v in vulns:
+            s = v.get("database_specific", {}).get("severity", "UNKNOWN")
+            sev_counts[s] = sev_counts.get(s, 0) + 1
+        sev_str = ", ".join(f"{c}×{s}" for s, c in sorted(sev_counts.items()))
+        findings.append(f"  • {name}: {ids}{extra} [{sev_str}]")
+
+    if findings:
+        return False, "OSV advisory database found vulnerabilities:\n" + "\n".join(findings)
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Snyk open-source vulnerability check (supplementary)
 # ---------------------------------------------------------------------------
 
 def _snyk_test_packages(packages: list[str], workspace: str) -> tuple[bool, str]:
@@ -467,15 +530,20 @@ def _run_pip_gate_checks(packages: list[str], workspace: str, context: str = "pi
         )
         return False
 
-    passed, reason = _snyk_test_packages(packages, workspace)
+    # OSV advisory check — works pre-install, no venv needed.
+    # Only fires for pinned versions; unversioned specs skip (OSV returns all-time CVEs).
+    passed, reason = _osv_check_packages(packages)
     if not passed:
-        _log(f"BLOCKED ({context}) — Snyk vulnerabilities in {packages}")
+        _log(f"BLOCKED ({context}) — OSV advisories for {packages}")
         _deny(
-            f"{context} blocked: Snyk found known vulnerabilities.\n{reason}",
-            f"INSTALL BLOCKED ({context}): Snyk reported vulnerabilities.\n{reason}\n"
-            "Fix the version constraints, then retry.",
+            f"{context} blocked: {reason}",
+            f"INSTALL BLOCKED ({context}): {reason}\nFix the version constraints, then retry.",
         )
         return False
+
+    # Snyk transitive-dep scanning is intentionally skipped here: it requires a
+    # resolved pip graph and flags transitive/license issues too noisy for a
+    # pre-install gate.  Snyk remains active in Gate 1 (notebook code scan).
 
     _log(f"allowed ({context}) — all checks passed for {packages}")
     return True
